@@ -15,7 +15,7 @@ type ApiFailureResponse = {
 
 type ApiResponse<T> = ApiSuccessResponse<T> | ApiFailureResponse;
 
-export type Video = {
+export type VideoListItem = {
   id: string;
   filename: string;
   original_url: string;
@@ -24,6 +24,12 @@ export type Video = {
   status: string;
   created_at: string;
   updated_at: string;
+};
+
+export type Video = VideoListItem & {
+  original_object_name: string | null;
+  audio_url: string | null;
+  audio_object_name: string | null;
 };
 
 export type VideoUploadResult = {
@@ -74,6 +80,14 @@ export type MockPipelineResult = {
   transcript_segments_created: number;
   semantic_segments_created: number;
   job_status: string;
+};
+
+export type AudioExtractionResult = {
+  video_id: string;
+  job_status: string;
+  audio_url: string;
+  audio_object_name: string;
+  duration_seconds: number;
 };
 
 export class ApiClientError extends Error {
@@ -138,8 +152,8 @@ export async function uploadVideo(file: File): Promise<VideoUploadResult> {
   });
 }
 
-export async function listVideos(): Promise<Video[]> {
-  return request<Video[]>("/api/videos");
+export async function listVideos(): Promise<VideoListItem[]> {
+  return request<VideoListItem[]>("/api/videos");
 }
 
 export async function getVideo(videoId: string): Promise<Video> {
@@ -157,6 +171,17 @@ export async function runMockPipeline(
 ): Promise<MockPipelineResult> {
   return request<MockPipelineResult>(
     `/api/videos/${videoId}/jobs/mock-pipeline`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export async function extractAudio(
+  videoId: string,
+): Promise<AudioExtractionResult> {
+  return request<AudioExtractionResult>(
+    `/api/videos/${videoId}/jobs/extract-audio`,
     {
       method: "POST",
     },

@@ -2,7 +2,13 @@
 
 Project skeleton for an AI video semantic segmentation system focused on splitting long-form video transcripts into semantic content segments for brand teams.
 
-This repository now includes the current MVP foundation for semantic video segmentation: SQLAlchemy models and Alembic migrations, a backend upload API that stores original videos in MinIO, a synchronous mock transcript + semantic segmentation pipeline, a frontend MVP for upload/list/detail flows, and a synchronous backend audio extraction API that downloads source video from MinIO, runs local FFmpeg to extract mono 16 kHz WAV audio, uploads the extracted audio back to MinIO, and stores audio metadata on the `videos` row.
+This repository currently includes:
+
+- SQLAlchemy models and Alembic migrations for the core MVP tables
+- A backend upload API that stores original videos in MinIO
+- A synchronous mock transcript and semantic segmentation pipeline
+- A frontend MVP for upload, list, and detail flows
+- A synchronous backend audio extraction API that downloads source video from MinIO, runs local FFmpeg to extract mono 16 kHz WAV audio, uploads the extracted audio back to MinIO, and stores audio metadata on the `videos` row
 
 ## Repository Layout
 
@@ -159,8 +165,24 @@ If browser requests fail, first confirm the API is running on `http://localhost:
 4. Open the home page in the browser.
 5. Upload a demo video file.
 6. Enter the video detail page after upload.
-7. Click `运行 Mock Pipeline`.
-8. Review the Chinese mock transcript and semantic segmentation results.
+7. Click the `Run Mock Pipeline` button.
+8. Review the mock transcript and semantic segmentation results.
+
+## Audio Extraction Smoke Test
+
+1. Confirm FFmpeg is available:
+
+```powershell
+ffmpeg -version
+ffprobe -version
+```
+
+2. Start infrastructure, backend, and frontend.
+3. Upload a new video from the home page. Use a newly uploaded video so `original_object_name` is guaranteed to exist.
+4. Open the video detail page and click the audio extraction button.
+5. Confirm the page shows non-empty `audio_url`, `audio_object_name`, and `duration_seconds`.
+6. Confirm the `extract_audio` job status becomes the completed audio extraction state.
+7. Open the MinIO Console at `http://localhost:9001` and verify `videos/{video_id}/audio/audio.wav` exists.
 
 ### Celery Worker
 
@@ -192,17 +214,17 @@ pytest
 
 - `GET /health` returns a minimal success payload.
 - Core SQLAlchemy tables are defined for videos, transcript segments, semantic segments, video clips, and processing jobs.
-- Alembic includes an initial `create_core_tables` migration.
+- Alembic includes the initial core tables migration and the video audio metadata migration.
 - `POST /api/videos/upload` stores the original video in MinIO, creates a `videos` record, and creates one pending `mock_pipeline` processing job.
 - `POST /api/videos/{video_id}/jobs/extract-audio` downloads the original MinIO object, extracts mono 16 kHz WAV audio with FFmpeg, uploads the generated audio back to MinIO, and stores audio metadata on the `videos` row.
-- `POST /api/videos/{video_id}/jobs/mock-pipeline` runs a synchronous mock transcript + semantic segmentation pipeline for product-loop validation.
+- `POST /api/videos/{video_id}/jobs/mock-pipeline` runs a synchronous mock transcript and semantic segmentation pipeline for product-loop validation.
 - `GET /api/videos` lists uploaded videos ordered by `created_at` descending.
 - `GET /api/videos/{video_id}` returns one video record.
 - `GET /api/videos/{video_id}/transcript` returns transcript segments in `sort_order` order, or an empty array when none exist.
 - `GET /api/videos/{video_id}/segments` returns mock semantic segments in `sort_order` order.
 - `GET /api/videos/{video_id}/jobs` returns processing jobs for the video.
 - The frontend MVP includes `/`, `/videos`, and `/videos/{id}` pages that call the existing backend APIs directly.
-- The frontend uses the synchronous mock pipeline and displays Chinese simulated transcript and semantic segment data.
+- The frontend uses the synchronous mock pipeline and can now trigger synchronous audio extraction from the detail page.
 - The frontend expects `NEXT_PUBLIC_API_BASE_URL` to point at the running FastAPI service.
 - Celery wiring is scaffolded, but no real video-processing tasks are implemented.
 

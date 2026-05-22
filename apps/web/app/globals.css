@@ -274,6 +274,21 @@ h1 {
   margin-bottom: 18px;
 }
 
+.detail-actions {
+  display: grid;
+  justify-items: end;
+  gap: 12px;
+}
+
+.detail-action-hint {
+  max-width: 280px;
+  margin: 0;
+  text-align: right;
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
 .section-title,
 .card-title {
   margin: 0;
@@ -404,6 +419,13 @@ h1 {
   margin-top: 22px;
 }
 
+.metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
 .stat-card {
   min-height: 110px;
   padding: 16px;
@@ -496,6 +518,7 @@ h1 {
 
   .hero-panel,
   .stats-grid,
+  .metadata-grid,
   .segment-grid,
   .table-grid {
     grid-template-columns: 1fr;
@@ -509,6 +532,16 @@ h1 {
   .segment-header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .detail-actions {
+    justify-items: stretch;
+    width: 100%;
+  }
+
+  .detail-action-hint {
+    max-width: none;
+    text-align: left;
   }
 
   .table-header {

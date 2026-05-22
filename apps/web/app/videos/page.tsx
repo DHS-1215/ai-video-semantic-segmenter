@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-import { ApiClientError, listVideos, type Video } from "@/lib/api";
+import { ApiClientError, listVideos, type VideoListItem } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
 
 function getVideoStatusLabel(status: string): string {
@@ -23,7 +23,7 @@ function getVideoStatusLabel(status: string): string {
 }
 
 export default function VideosPage() {
-  const [videos, setVideos] = useState<Video[]>([]);
+  const [videos, setVideos] = useState<VideoListItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 

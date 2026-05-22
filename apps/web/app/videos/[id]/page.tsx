@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 
 import {
   ApiClientError,
+  extractAudio,
   getJobs,
   getSegments,
   getTranscript,
@@ -47,6 +48,7 @@ export default function VideoDetailPage() {
   >({});
   const [isLoading, setIsLoading] = useState(true);
   const [isRunningPipeline, setIsRunningPipeline] = useState(false);
+  const [isExtractingAudio, setIsExtractingAudio] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
@@ -74,9 +76,7 @@ export default function VideoDetailPage() {
       if (error instanceof ApiClientError) {
         setErrorMessage(error.message);
       } else {
-        setErrorMessage(
-          "\u52a0\u8f7d\u89c6\u9891\u8be6\u60c5\u5931\u8d25\u3002",
-        );
+        setErrorMessage("\u52a0\u8f7d\u89c6\u9891\u8be6\u60c5\u5931\u8d25\u3002");
       }
     } finally {
       setIsLoading(false);
@@ -126,13 +126,65 @@ export default function VideoDetailPage() {
       if (error instanceof ApiClientError) {
         setErrorMessage(error.message);
       } else {
-        setErrorMessage(
-          "\u8fd0\u884c Mock Pipeline \u5931\u8d25\u3002",
-        );
+        setErrorMessage("\u8fd0\u884c Mock Pipeline \u5931\u8d25\u3002");
       }
     } finally {
       setIsRunningPipeline(false);
     }
+  }
+
+  async function handleExtractAudio() {
+    if (!videoId) {
+      return;
+    }
+
+    setIsExtractingAudio(true);
+    setActionMessage(null);
+    setErrorMessage(null);
+
+    try {
+      const result = await extractAudio(videoId);
+      setActionMessage(
+        `\u97f3\u9891\u63d0\u53d6\u5b8c\u6210\uff1a\u5df2\u751f\u6210 audio.wav\uff0c\u65f6\u957f ${formatSeconds(result.duration_seconds)}\u3002`,
+      );
+      await loadVideoData({ preserveData: true });
+    } catch (error) {
+      if (error instanceof ApiClientError) {
+        setErrorMessage(error.message);
+      } else {
+        setErrorMessage("\u63d0\u53d6\u97f3\u9891\u5931\u8d25\u3002");
+      }
+    } finally {
+      setIsExtractingAudio(false);
+    }
+  }
+
+  function getJobTypeLabel(job: ProcessingJob): string {
+    if (job.job_type === "extract_audio") {
+      return "\u63d0\u53d6\u97f3\u9891";
+    }
+
+    return job.job_type;
+  }
+
+  function getJobStatusLabel(job: ProcessingJob): string {
+    if (job.job_type !== "extract_audio") {
+      return job.status;
+    }
+
+    if (job.status === "completed") {
+      return "\u97f3\u9891\u63d0\u53d6\u5b8c\u6210";
+    }
+
+    if (job.status === "failed") {
+      return "\u97f3\u9891\u63d0\u53d6\u5931\u8d25";
+    }
+
+    if (job.status === "running") {
+      return "\u97f3\u9891\u63d0\u53d6\u4e2d";
+    }
+
+    return job.status;
   }
 
   const { video, transcript, segments, jobs } = detailState;
@@ -140,6 +192,8 @@ export default function VideoDetailPage() {
   const hasSegments = segments.length > 0;
   const hasExistingResults = hasTranscript || hasSegments;
   const shouldShowGenerationGuide = !hasTranscript && !hasSegments;
+  const canExtractAudio = Boolean(video?.original_object_name);
+  const hasExtractedAudio = Boolean(video?.audio_object_name);
   const pipelineButtonLabel = hasExistingResults
     ? "\u91cd\u65b0\u8fd0\u884c Mock Pipeline"
     : "\u8fd0\u884c Mock Pipeline";
@@ -227,36 +281,85 @@ export default function VideoDetailPage() {
                     ))}
                   </div>
                 </div>
-                <button
-                  className="primary-button"
-                  disabled={isRunningPipeline}
-                  onClick={handleRunMockPipeline}
-                  type="button"
-                >
-                  {isRunningPipeline
-                    ? "\u8fd0\u884c\u4e2d..."
-                    : pipelineButtonLabel}
-                </button>
+                <div className="detail-actions">
+                  <button
+                    className="primary-button"
+                    disabled={isRunningPipeline}
+                    onClick={handleRunMockPipeline}
+                    type="button"
+                  >
+                    {isRunningPipeline
+                      ? "\u8fd0\u884c\u4e2d..."
+                      : pipelineButtonLabel}
+                  </button>
+                  <button
+                    className="secondary-button"
+                    disabled={!canExtractAudio || isExtractingAudio}
+                    onClick={handleExtractAudio}
+                    type="button"
+                  >
+                    {isExtractingAudio
+                      ? "\u63d0\u53d6\u4e2d..."
+                      : "\u63d0\u53d6\u97f3\u9891"}
+                  </button>
+                  {!canExtractAudio ? (
+                    <p className="detail-action-hint">
+                      {
+                        "\u5386\u53f2\u4e0a\u4f20\u8bb0\u5f55\u7f3a\u5c11 original_object_name\uff0c\u8bf7\u91cd\u65b0\u4e0a\u4f20\u89c6\u9891\u3002"
+                      }
+                    </p>
+                  ) : null}
+                </div>
               </div>
 
               <div className="stats-grid">
                 <div className="stat-card">
-                  <span className="stat-label">\u72b6\u6001</span>
+                  <span className="stat-label">{"\u72b6\u6001"}</span>
                   <span className={`status-pill status-${video.status}`}>
                     {video.status}
                   </span>
                 </div>
                 <div className="stat-card">
-                  <span className="stat-label">\u521b\u5efa\u65f6\u95f4</span>
+                  <span className="stat-label">{"\u521b\u5efa\u65f6\u95f4"}</span>
                   <span>{formatDateTime(video.created_at)}</span>
                 </div>
                 <div className="stat-card">
-                  <span className="stat-label">\u65f6\u957f</span>
+                  <span className="stat-label">{"\u65f6\u957f"}</span>
                   <span>{formatSeconds(video.duration_seconds)}</span>
                 </div>
                 <div className="stat-card">
-                  <span className="stat-label">\u539f\u59cb\u5730\u5740</span>
+                  <span className="stat-label">{"\u539f\u59cb\u5730\u5740"}</span>
                   <span className="truncate-text">{video.original_url}</span>
+                </div>
+              </div>
+
+              <div className="metadata-grid">
+                <div className="stat-card">
+                  <span className="stat-label">original_object_name</span>
+                  <span className="truncate-text">
+                    {video.original_object_name ??
+                      "\u5386\u53f2\u4e0a\u4f20\u8bb0\u5f55\u7f3a\u5c11 original_object_name"}
+                  </span>
+                </div>
+                <div className="stat-card">
+                  <span className="stat-label">audio_url</span>
+                  <span className="truncate-text">
+                    {video.audio_url ?? "\u5c1a\u672a\u63d0\u53d6\u97f3\u9891"}
+                  </span>
+                </div>
+                <div className="stat-card">
+                  <span className="stat-label">audio_object_name</span>
+                  <span className="truncate-text">
+                    {video.audio_object_name ?? "\u5c1a\u672a\u63d0\u53d6\u97f3\u9891"}
+                  </span>
+                </div>
+                <div className="stat-card">
+                  <span className="stat-label">duration_seconds</span>
+                  <span>
+                    {hasExtractedAudio
+                      ? formatSeconds(video.duration_seconds)
+                      : "\u5c1a\u672a\u63d0\u53d6\u97f3\u9891"}
+                  </span>
                 </div>
               </div>
             </div>
@@ -271,7 +374,7 @@ export default function VideoDetailPage() {
 
             <section className="content-section">
               <div className="section-subheading">
-                <h2 className="card-title">\u5904\u7406\u4efb\u52a1</h2>
+                <h2 className="card-title">{"\u5904\u7406\u4efb\u52a1"}</h2>
                 <span className="section-count">{jobs.length} {"\u6761"}</span>
               </div>
               {jobs.length === 0 ? (
@@ -284,11 +387,11 @@ export default function VideoDetailPage() {
                     <article className="page-card compact-card" key={job.id}>
                       <div className="job-row">
                         <div>
-                          <strong>{job.job_type}</strong>
+                          <strong>{getJobTypeLabel(job)}</strong>
                           <p className="muted-row">{formatDateTime(job.created_at)}</p>
                         </div>
                         <span className={`status-pill status-${job.status}`}>
-                          {job.status}
+                          {getJobStatusLabel(job)}
                         </span>
                       </div>
                       {job.error_message ? (
@@ -302,7 +405,7 @@ export default function VideoDetailPage() {
 
             <section className="content-section">
               <div className="section-subheading">
-                <h2 className="card-title">\u8f6c\u5199\u6587\u672c</h2>
+                <h2 className="card-title">{"\u8f6c\u5199\u6587\u672c"}</h2>
                 <span className="section-count">
                   {transcript.length} {"\u6761"}
                 </span>
@@ -333,7 +436,7 @@ export default function VideoDetailPage() {
 
             <section className="content-section">
               <div className="section-subheading">
-                <h2 className="card-title">\u8bed\u4e49\u5206\u6bb5</h2>
+                <h2 className="card-title">{"\u8bed\u4e49\u5206\u6bb5"}</h2>
                 <span className="section-count">
                   {segments.length} {"\u4e2a"}
                 </span>
