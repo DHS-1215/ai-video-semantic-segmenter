@@ -7,7 +7,12 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_asr_provider, get_db, get_object_storage_service
+from app.api.deps import (
+    get_asr_provider,
+    get_db,
+    get_object_storage_service,
+    get_semantic_segmenter_provider,
+)
 from app.core.config import get_settings
 from app.core.constants import (
     JOB_STATUS_PENDING,
@@ -21,6 +26,7 @@ from app.schemas.job import (
     AudioExtractionResponse,
     MockPipelineResponse,
     ProcessingJobResponse,
+    SemanticSegmentationResponse,
     TranscriptionResponse,
 )
 from app.schemas.semantic import SemanticSegmentResponse
@@ -29,6 +35,8 @@ from app.schemas.video import VideoListItem, VideoResponse, VideoUploadResponse
 from app.services.asr import ASRProvider
 from app.services.audio_extraction import extract_audio_for_video
 from app.services.mock_pipeline import run_mock_pipeline
+from app.services.semantic_segmentation import segment_transcript_for_video
+from app.services.semantic_segmenter import SemanticSegmenterProvider
 from app.services.storage import ObjectStorageService, StoredObject, make_safe_filename
 from app.services.transcription import transcribe_audio_for_video
 
@@ -193,6 +201,31 @@ def trigger_audio_transcription(
         asr_provider=asr_provider,
     )
     return SuccessResponse(data=TranscriptionResponse(**result))
+
+
+@router.post(
+    "/{video_id}/jobs/semantic-segmentation",
+    response_model=SuccessResponse[SemanticSegmentationResponse],
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+def trigger_semantic_segmentation(
+    video_id: UUID,
+    db: Session = Depends(get_db),
+    segmenter_provider: SemanticSegmenterProvider = Depends(
+        get_semantic_segmenter_provider
+    ),
+) -> SuccessResponse[SemanticSegmentationResponse]:
+    video = _get_video_or_404(db, video_id)
+    result = segment_transcript_for_video(
+        db=db,
+        video=video,
+        segmenter_provider=segmenter_provider,
+    )
+    return SuccessResponse(data=SemanticSegmentationResponse(**result))
 
 
 @router.get(

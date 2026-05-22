@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import {
   ApiClientError,
   extractAudio,
+  generateSemanticSegments,
   getJobs,
   getSegments,
   getTranscript,
@@ -51,6 +52,8 @@ export default function VideoDetailPage() {
   const [isRunningPipeline, setIsRunningPipeline] = useState(false);
   const [isExtractingAudio, setIsExtractingAudio] = useState(false);
   const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
+  const [isGeneratingSemanticSegments, setIsGeneratingSemanticSegments] =
+    useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
@@ -196,6 +199,42 @@ export default function VideoDetailPage() {
     }
   }
 
+  async function handleGenerateSemanticSegments() {
+    if (!videoId) {
+      return;
+    }
+
+    if (
+      segments.length > 0 &&
+      !window.confirm(
+        "\u91cd\u65b0\u751f\u6210\u4f1a\u8986\u76d6\u5f53\u524d\u8bed\u4e49\u5206\u6bb5\u7ed3\u679c\uff0c\u662f\u5426\u7ee7\u7eed\uff1f",
+      )
+    ) {
+      return;
+    }
+
+    setIsGeneratingSemanticSegments(true);
+    setActionMessage(null);
+    setErrorMessage(null);
+
+    try {
+      const result = await generateSemanticSegments(videoId);
+      setActionMessage(
+        `\u8bed\u4e49\u5206\u6bb5\u5df2\u5b8c\u6210\uff1a\u751f\u6210 ${result.semantic_segments_created} \u4e2a\u8bed\u4e49\u5206\u6bb5\u3002`,
+      );
+      setExpandedSegmentIds({});
+      await loadVideoData({ preserveData: true });
+    } catch (error) {
+      if (error instanceof ApiClientError) {
+        setErrorMessage(error.message);
+      } else {
+        setErrorMessage("\u751f\u6210\u8bed\u4e49\u5206\u6bb5\u5931\u8d25\u3002");
+      }
+    } finally {
+      setIsGeneratingSemanticSegments(false);
+    }
+  }
+
   function getJobTypeLabel(job: ProcessingJob): string {
     if (job.job_type === "extract_audio") {
       return "\u63d0\u53d6\u97f3\u9891";
@@ -203,6 +242,10 @@ export default function VideoDetailPage() {
 
     if (job.job_type === "transcribe_audio") {
       return "\u751f\u6210\u8f6c\u5199";
+    }
+
+    if (job.job_type === "semantic_segment") {
+      return "\u751f\u6210\u8bed\u4e49\u5206\u6bb5";
     }
 
     return job.job_type;
@@ -243,6 +286,24 @@ export default function VideoDetailPage() {
       }
     }
 
+    if (job.job_type === "semantic_segment") {
+      if (job.status === "completed") {
+        return "\u8bed\u4e49\u5206\u6bb5\u5b8c\u6210";
+      }
+
+      if (job.status === "failed") {
+        return "\u8bed\u4e49\u5206\u6bb5\u5931\u8d25";
+      }
+
+      if (job.status === "running") {
+        return "\u8bed\u4e49\u5206\u6bb5\u4e2d";
+      }
+
+      if (job.status === "pending") {
+        return "\u7b49\u5f85\u8bed\u4e49\u5206\u6bb5";
+      }
+    }
+
     return job.status;
   }
 
@@ -253,6 +314,7 @@ export default function VideoDetailPage() {
   const shouldShowGenerationGuide = !hasTranscript && !hasSegments;
   const canExtractAudio = Boolean(video?.original_object_name);
   const canTranscribeAudio = Boolean(video?.audio_object_name);
+  const canGenerateSemanticSegments = transcript.length > 0;
   const hasExtractedAudio = Boolean(video?.audio_object_name);
   const pipelineButtonLabel = hasExistingResults
     ? "\u91cd\u65b0\u8fd0\u884c Mock Pipeline"
@@ -260,11 +322,18 @@ export default function VideoDetailPage() {
   const transcriptionButtonLabel = hasTranscript
     ? "\u91cd\u65b0\u751f\u6210\u8f6c\u5199"
     : "\u751f\u6210\u8f6c\u5199";
+  const semanticSegmentationButtonLabel = hasSegments
+    ? "\u91cd\u65b0\u751f\u6210\u8bed\u4e49\u5206\u6bb5"
+    : "\u751f\u6210\u8bed\u4e49\u5206\u6bb5";
 
   const steps: StepItem[] = [
     {
       label: "\u89c6\u9891\u5df2\u4e0a\u4f20",
       completed: Boolean(video),
+    },
+    {
+      label: "\u97f3\u9891\u5df2\u63d0\u53d6",
+      completed: hasExtractedAudio,
     },
     {
       label: "\u8f6c\u5199\u6587\u672c\u5df2\u751f\u6210",
@@ -375,6 +444,18 @@ export default function VideoDetailPage() {
                       ? "\u751f\u6210\u8f6c\u5199\u4e2d..."
                       : transcriptionButtonLabel}
                   </button>
+                  <button
+                    className="secondary-button"
+                    disabled={
+                      !canGenerateSemanticSegments || isGeneratingSemanticSegments
+                    }
+                    onClick={handleGenerateSemanticSegments}
+                    type="button"
+                  >
+                    {isGeneratingSemanticSegments
+                      ? "\u751f\u6210\u8bed\u4e49\u5206\u6bb5\u4e2d..."
+                      : semanticSegmentationButtonLabel}
+                  </button>
                   {!canExtractAudio ? (
                     <p className="detail-action-hint">
                       {
@@ -385,6 +466,11 @@ export default function VideoDetailPage() {
                   {!canTranscribeAudio ? (
                     <p className="detail-action-hint">
                       {"\u8bf7\u5148\u63d0\u53d6\u97f3\u9891\u3002"}
+                    </p>
+                  ) : null}
+                  {!canGenerateSemanticSegments ? (
+                    <p className="detail-action-hint">
+                      {"\u8bf7\u5148\u751f\u6210\u8f6c\u5199\u3002"}
                     </p>
                   ) : null}
                 </div>
@@ -523,7 +609,9 @@ export default function VideoDetailPage() {
               </div>
               {segments.length === 0 ? (
                 <div className="empty-state">
-                  {"\u8fd8\u6ca1\u6709\u8bed\u4e49\u5206\u6bb5\u7ed3\u679c\uff0c\u5148\u8fd0\u884c Mock Pipeline\u3002"}
+                  {
+                    "\u8fd8\u6ca1\u6709\u8bed\u4e49\u5206\u6bb5\u7ed3\u679c\uff0c\u53ef\u4ee5\u5148\u751f\u6210\u8f6c\u5199\u518d\u8fd0\u884c\u8bed\u4e49\u5206\u6bb5\uff0c\u6216\u8005\u76f4\u63a5\u8fd0\u884c Mock Pipeline\u3002"
+                  }
                 </div>
               ) : (
                 <div className="segment-grid">

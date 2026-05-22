@@ -96,6 +96,12 @@ export type TranscriptionResult = {
   job_status: string;
 };
 
+export type SemanticSegmentationResult = {
+  video_id: string;
+  semantic_segments_created: number;
+  job_status: string;
+};
+
 export class ApiClientError extends Error {
   code: string;
   status: number;
@@ -199,6 +205,17 @@ export async function transcribeAudio(
 ): Promise<TranscriptionResult> {
   return request<TranscriptionResult>(
     `/api/videos/${videoId}/jobs/transcribe-audio`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export async function generateSemanticSegments(
+  videoId: string,
+): Promise<SemanticSegmentationResult> {
+  return request<SemanticSegmentationResult>(
+    `/api/videos/${videoId}/jobs/semantic-segmentation`,
     {
       method: "POST",
     },

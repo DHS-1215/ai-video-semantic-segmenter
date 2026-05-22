@@ -7,18 +7,59 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_asr_provider, get_db, get_object_storage_service
+from app.api.deps import (
+    get_asr_provider,
+    get_db,
+    get_object_storage_service,
+    get_semantic_segmenter_provider,
+)
 from app.core.constants import (
     JOB_STATUS_COMPLETED,
     JOB_STATUS_FAILED,
     JOB_STATUS_PENDING,
     PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
     PROCESSING_JOB_TYPE_MOCK_PIPELINE,
+    PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
     PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
 )
 from app.main import app
-from app.models import ProcessingJob, TranscriptSegment, Video
+from app.models import ProcessingJob, SemanticSegment, TranscriptSegment, Video
 from app.services import audio_extraction as audio_extraction_service
+
+
+def _build_transcript_segments(
+    video: Video,
+    entries: list[tuple[float, float, str | None, str]],
+) -> list[TranscriptSegment]:
+    return [
+        TranscriptSegment(
+            video=video,
+            start_time=start_time,
+            end_time=end_time,
+            speaker=speaker,
+            text=text,
+            sort_order=sort_order,
+        )
+        for sort_order, (start_time, end_time, speaker, text) in enumerate(
+            entries,
+            start=1,
+        )
+    ]
+
+
+def _semantic_test_transcript_entries() -> list[tuple[float, float, str | None, str]]:
+    return [
+        (0.0, 36.0, "林晓", "今天先从品牌团队处理长视频内容的现状讲起，我们每天都要整理发布会和访谈视频。"),
+        (36.0, 78.0, "周明", "现在最大的成本还是人工回看视频，想找到一个完整话题往往要拖很多次时间轴。"),
+        (78.0, 122.0, "林晓", "如果只有零散片段，没有上下文，品牌审核和后续剪辑都很难判断内容是否完整。"),
+        (122.0, 164.0, "周明", "所以第一步必须先把音频提取出来，再把说话内容整理成可阅读的转写文本。"),
+        (164.0, 208.0, "林晓", "有了转写之后，团队才能基于文本去检索关键词，而不是反复回听整段音频。"),
+        (208.0, 252.0, "周明", "接下来语义分段要解决的问题，是把连续讨论品牌策略的内容归在同一个内容单元。"),
+        (252.0, 294.0, "林晓", "如果系统能给出每段标题、摘要和关键词，审核同学会更容易理解这段内容在讲什么。"),
+        (294.0, 338.0, "周明", "这些结构化元数据也能帮助后续团队做素材复用，比如官网摘要、案例整理和社媒脚本。"),
+        (338.0, 380.0, "林晓", "这一轮我们先用 Mock provider 跑通接口和数据结构，确认前后端能完整消费语义分段结果。"),
+        (380.0, 420.0, "周明", "等到抽象稳定之后，再替换成真实 LLM 服务去判断主题边界和分段理由。"),
+    ]
 
 
 def test_upload_video_success_creates_video_and_job(
@@ -612,6 +653,274 @@ def test_transcribe_audio_provider_failure_marks_job_failed(
     assert job.status == JOB_STATUS_FAILED
     assert job.error_message is not None
     assert "provider failed" in job.error_message
+
+
+def test_semantic_segmentation_requires_video(client: TestClient) -> None:
+    response = client.post(f"/api/videos/{uuid4()}/jobs/semantic-segmentation")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "video_not_found",
+            "message": "Video not found.",
+        },
+    }
+
+
+def test_semantic_segmentation_requires_transcript_segments(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="no-transcript.mp4",
+        original_url="http://storage.local/videos/no-transcript.mp4",
+        original_object_name="videos/example/original/no-transcript.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "missing_transcript_segments",
+            "message": "Transcript segments are missing.",
+        },
+    }
+    assert (
+        db_session.scalar(
+            select(func.count(ProcessingJob.id)).where(
+                ProcessingJob.video_id == video.id,
+                ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+            )
+        )
+        == 0
+    )
+
+
+def test_semantic_segmentation_success_creates_semantic_segments(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-success.mp4",
+        original_url="http://storage.local/videos/semantic-success.mp4",
+        original_object_name="videos/example/original/semantic-success.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        _semantic_test_transcript_entries(),
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "semantic_segments_created": 5,
+        "job_status": JOB_STATUS_COMPLETED,
+    }
+
+    semantic_segments = db_session.scalars(
+        select(SemanticSegment)
+        .where(SemanticSegment.video_id == video.id)
+        .order_by(SemanticSegment.sort_order.asc())
+    ).all()
+    assert len(semantic_segments) == 5
+    assert [segment.sort_order for segment in semantic_segments] == [1, 2, 3, 4, 5]
+    assert semantic_segments[0].start_time == 0.0
+    assert semantic_segments[-1].end_time == 420.0
+    assert all(segment.transcript_text.strip() for segment in semantic_segments)
+    assert "品牌团队处理长视频内容" in semantic_segments[0].transcript_text
+    assert all(0.0 <= segment.confidence <= 1.0 for segment in semantic_segments)
+
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_COMPLETED
+    assert job.error_message is None
+
+
+def test_semantic_segmentation_is_idempotent_for_segments(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-idempotent.mp4",
+        original_url="http://storage.local/videos/semantic-idempotent.mp4",
+        original_object_name="videos/example/original/semantic-idempotent.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        _semantic_test_transcript_entries(),
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    first_response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+    second_response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert (
+        db_session.scalar(
+            select(func.count(SemanticSegment.id)).where(
+                SemanticSegment.video_id == video.id
+            )
+        )
+        == 5
+    )
+    assert (
+        db_session.scalar(
+            select(func.count(ProcessingJob.id)).where(
+                ProcessingJob.video_id == video.id,
+                ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+            )
+        )
+        == 1
+    )
+
+
+def test_semantic_segmentation_provider_failure_marks_job_failed(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-provider-fail.mp4",
+        original_url="http://storage.local/videos/semantic-provider-fail.mp4",
+        original_object_name="videos/example/original/semantic-provider-fail.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        _semantic_test_transcript_entries(),
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    class FailingSegmenterProvider:
+        def segment(self, transcript_segments: list[TranscriptSegment]):
+            raise RuntimeError(f"provider failed for {len(transcript_segments)} segments")
+
+    app.dependency_overrides[get_semantic_segmenter_provider] = (
+        lambda: FailingSegmenterProvider()
+    )
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+    finally:
+        app.dependency_overrides.pop(get_semantic_segmenter_provider, None)
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "semantic_segmentation_failed",
+            "message": "Failed to generate semantic segments.",
+        },
+    }
+    assert (
+        db_session.scalar(
+            select(func.count(SemanticSegment.id)).where(
+                SemanticSegment.video_id == video.id
+            )
+        )
+        == 0
+    )
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+    assert "provider failed" in job.error_message
+
+
+def test_semantic_segmentation_with_short_transcript_still_creates_segment(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-short.mp4",
+        original_url="http://storage.local/videos/semantic-short.mp4",
+        original_object_name="videos/example/original/semantic-short.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=48.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        [
+            (
+                0.0,
+                48.0,
+                "林晓",
+                "这是一段简短的品牌视频说明，但依然需要生成一个完整的语义段结果。",
+            )
+        ],
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "semantic_segments_created": 1,
+        "job_status": JOB_STATUS_COMPLETED,
+    }
+
+    semantic_segments = db_session.scalars(
+        select(SemanticSegment)
+        .where(SemanticSegment.video_id == video.id)
+        .order_by(SemanticSegment.sort_order.asc())
+    ).all()
+    assert len(semantic_segments) == 1
+    assert semantic_segments[0].sort_order == 1
+    assert semantic_segments[0].transcript_text.strip()
+    assert 0.0 <= semantic_segments[0].confidence <= 1.0
 
 
 def test_extract_audio_storage_download_failure_marks_job_failed(

@@ -35,3 +35,9 @@ class TranscriptionResponse(BaseModel):
     video_id: UUID
     transcript_segments_created: int
     job_status: str
+
+
+class SemanticSegmentationResponse(BaseModel):
+    video_id: UUID
+    semantic_segments_created: int
+    job_status: str

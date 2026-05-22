@@ -187,9 +187,43 @@ Example success response:
 }
 ```
 
+### `POST /api/videos/{video_id}/jobs/semantic-segmentation`
+
+Reads the current `transcript_segments` for the target video, calls `MockSemanticSegmenterProvider`, and stores semantic rows into `semantic_segments`.
+
+Requirements:
+
+- The video must already have transcript rows, otherwise the API returns `400 missing_transcript_segments`
+
+Behavior:
+
+- Reuses or creates a `processing_jobs` row with `job_type = "semantic_segment"`
+- Sets job status `running -> completed` on success
+- Replaces existing semantic segment rows for the target video before writing the new segmentation results
+- Returns `500 semantic_segmentation_failed` if the provider or final persistence fails
+- This round uses `MockSemanticSegmenterProvider` only. It does not call any real LLM vendor or local model
+
+Example success response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "video_id": "d828ea75-bd27-4cbf-9fd3-4c480d9a577c",
+    "semantic_segments_created": 5,
+    "job_status": "completed"
+  }
+}
+```
+
 ### `GET /api/videos/{video_id}/segments`
 
 Returns semantic segments ordered by `sort_order` ascending.
+
+Current sources of semantic segment rows:
+
+- `POST /api/videos/{video_id}/jobs/semantic-segmentation` via `MockSemanticSegmenterProvider`
+- `POST /api/videos/{video_id}/jobs/mock-pipeline` via the existing demo pipeline
 
 ### `GET /api/videos/{video_id}/jobs`
 
@@ -197,8 +231,8 @@ Returns processing jobs ordered by `created_at` descending.
 
 ## Scope
 
-- This round adds synchronous FFmpeg-based audio extraction and synchronous mock-ASR transcription.
-- This round does not implement any real ASR provider, real LLM semantic segmentation, Celery processing, or clip export.
+- This round adds synchronous FFmpeg-based audio extraction, synchronous mock-ASR transcription, and synchronous mock semantic segmentation.
+- This round does not implement any real ASR provider, real LLM semantic segmentation provider, Celery processing, or clip export.
 - The transcript and semantic segment data returned by the mock pipeline are synthetic Chinese fixtures for product loop validation in a brand-team scenario only.
 - Uploading a video only stores the original file and creates a pending `mock_pipeline` job for future processing stages.
-- Audio extraction and mock transcription do not trigger semantic segmentation yet.
+- Audio extraction, mock transcription, and mock semantic segmentation remain separate API steps and are not chained automatically.
