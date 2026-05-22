@@ -19,7 +19,10 @@ def test_video_can_be_created(db_session: Session) -> None:
     video = Video(
         filename="demo-video.mp4",
         original_url="http://localhost:9000/videos/demo-video.mp4",
+        original_object_name="videos/demo/original/demo-video.mp4",
         preview_url=None,
+        audio_url="http://localhost:9000/videos/demo/audio/audio.wav",
+        audio_object_name="videos/demo/audio/audio.wav",
         duration_seconds=120.5,
         status=VIDEO_STATUS_PENDING,
     )
@@ -32,6 +35,9 @@ def test_video_can_be_created(db_session: Session) -> None:
 
     assert saved_video is not None
     assert saved_video.filename == "demo-video.mp4"
+    assert saved_video.original_object_name == "videos/demo/original/demo-video.mp4"
+    assert saved_video.audio_url == "http://localhost:9000/videos/demo/audio/audio.wav"
+    assert saved_video.audio_object_name == "videos/demo/audio/audio.wav"
     assert saved_video.created_at is not None
     assert saved_video.updated_at is not None
 

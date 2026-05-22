@@ -18,7 +18,9 @@ class VideoListItem(BaseModel):
 
 
 class VideoResponse(VideoListItem):
-    pass
+    original_object_name: str | None
+    audio_url: str | None
+    audio_object_name: str | None
 
 
 class VideoUploadResponse(BaseModel):

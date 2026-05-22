@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -7,9 +8,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_object_storage_service
-from app.core.constants import JOB_STATUS_PENDING, PROCESSING_JOB_TYPE_MOCK_PIPELINE
+from app.core.constants import (
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_PENDING,
+    PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+    PROCESSING_JOB_TYPE_MOCK_PIPELINE,
+)
 from app.main import app
 from app.models import ProcessingJob, TranscriptSegment, Video
+from app.services import audio_extraction as audio_extraction_service
 
 
 def test_upload_video_success_creates_video_and_job(
@@ -34,10 +42,29 @@ def test_upload_video_success_creates_video_and_job(
     saved_video = db_session.get(Video, UUID(payload["data"]["video_id"]))
     assert saved_video is not None
     assert saved_video.filename == "demo.mp4"
+    assert saved_video.original_object_name == "videos/" + str(saved_video.id) + "/original/demo.mp4"
 
     job = db_session.query(ProcessingJob).filter_by(video_id=saved_video.id).one()
     assert job.job_type == PROCESSING_JOB_TYPE_MOCK_PIPELINE
     assert job.status == JOB_STATUS_PENDING
+
+
+def test_upload_video_sets_original_object_name(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    response = client.post(
+        "/api/videos/upload",
+        files={"file": ("source.mov", BytesIO(b"video-data"), "video/quicktime")},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    saved_video = db_session.get(Video, UUID(payload["data"]["video_id"]))
+
+    assert saved_video is not None
+    assert saved_video.original_object_name is not None
+    assert saved_video.original_object_name.endswith("/original/source.mov")
 
 
 def test_upload_video_rejects_empty_file(client: TestClient) -> None:
@@ -228,7 +255,10 @@ def test_get_video_returns_detail(client: TestClient, db_session: Session) -> No
         id=uuid4(),
         filename="detail.mp4",
         original_url="http://storage.local/videos/detail.mp4",
+        original_object_name="videos/example/original/detail.mp4",
         preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
         duration_seconds=42.0,
         status="pending",
     )
@@ -242,6 +272,11 @@ def test_get_video_returns_detail(client: TestClient, db_session: Session) -> No
     assert payload["success"] is True
     assert payload["data"]["id"] == str(video.id)
     assert payload["data"]["filename"] == "detail.mp4"
+    assert payload["data"]["original_object_name"] == "videos/example/original/detail.mp4"
+    assert payload["data"]["audio_url"] == (
+        "http://storage.local/videos/videos/example/audio/audio.wav"
+    )
+    assert payload["data"]["audio_object_name"] == "videos/example/audio/audio.wav"
 
 
 def test_get_missing_video_returns_404(client: TestClient) -> None:
@@ -255,6 +290,328 @@ def test_get_missing_video_returns_404(client: TestClient) -> None:
             "message": "Video not found.",
         },
     }
+
+
+def test_extract_audio_requires_video(client: TestClient) -> None:
+    response = client.post(f"/api/videos/{uuid4()}/jobs/extract-audio")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "video_not_found",
+            "message": "Video not found.",
+        },
+    }
+
+
+def test_extract_audio_requires_original_object_name(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="legacy.mp4",
+        original_url="http://storage.local/videos/legacy.mp4",
+        original_object_name=None,
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    response = client.post(f"/api/videos/{video.id}/jobs/extract-audio")
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "missing_original_object",
+            "message": "Video original object is missing.",
+        },
+    }
+    assert (
+        db_session.scalar(
+            select(func.count(ProcessingJob.id)).where(
+                ProcessingJob.video_id == video.id,
+                ProcessingJob.job_type == PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+            )
+        )
+        == 0
+    )
+
+
+def test_extract_audio_success_updates_video_and_job(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+    monkeypatch,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="demo.mp4",
+        original_url="http://storage.local/videos/demo.mp4",
+        original_object_name=f"videos/{uuid4()}/original/demo.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    def fake_extract_audio(_: str, output_audio_path: str) -> float:
+        Path(output_audio_path).write_bytes(b"wav-data")
+        return 42.5
+
+    monkeypatch.setattr(
+        audio_extraction_service.ffmpeg_service,
+        "extract_audio",
+        fake_extract_audio,
+    )
+
+    response = client.post(f"/api/videos/{video.id}/jobs/extract-audio")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "job_status": JOB_STATUS_COMPLETED,
+        "audio_url": f"http://storage.local/videos/videos/{video.id}/audio/audio.wav",
+        "audio_object_name": f"videos/{video.id}/audio/audio.wav",
+        "duration_seconds": 42.5,
+    }
+    assert len(fake_storage_service.downloads) == 1
+    assert fake_storage_service.downloads[0]["bucket"] == "videos"
+    assert fake_storage_service.downloads[0]["object_name"] == video.original_object_name
+
+    db_session.expire_all()
+    saved_video = db_session.get(Video, video.id)
+    assert saved_video is not None
+    assert saved_video.audio_url == payload["data"]["audio_url"]
+    assert saved_video.audio_object_name == payload["data"]["audio_object_name"]
+    assert saved_video.duration_seconds == 42.5
+
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_COMPLETED
+    assert job.error_message is None
+    assert fake_storage_service.uploads[-1]["object_name"] == (
+        f"videos/{video.id}/audio/audio.wav"
+    )
+
+
+def test_extract_audio_storage_download_failure_marks_job_failed(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="download-fail.mp4",
+        original_url="http://storage.local/videos/download-fail.mp4",
+        original_object_name=f"videos/{uuid4()}/original/download-fail.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+    fake_storage_service.raise_on_download = True
+
+    response = client.post(f"/api/videos/{video.id}/jobs/extract-audio")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "audio_extraction_failed",
+            "message": "Failed to extract audio.",
+        },
+    }
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+        )
+    ).one()
+    saved_video = db_session.get(Video, video.id)
+    assert saved_video is not None
+    assert saved_video.audio_url is None
+    assert saved_video.audio_object_name is None
+    assert saved_video.duration_seconds is None
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+    assert "download failed" in job.error_message
+
+
+def test_extract_audio_ffmpeg_failure_marks_job_failed(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="ffmpeg-fail.mp4",
+        original_url="http://storage.local/videos/ffmpeg-fail.mp4",
+        original_object_name=f"videos/{uuid4()}/original/ffmpeg-fail.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    def fake_extract_audio(_: str, __: str) -> float:
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(
+        audio_extraction_service.ffmpeg_service,
+        "extract_audio",
+        fake_extract_audio,
+    )
+
+    response = client.post(f"/api/videos/{video.id}/jobs/extract-audio")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "audio_extraction_failed",
+            "message": "Failed to extract audio.",
+        },
+    }
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+    assert "ffmpeg exploded" in job.error_message
+
+
+def test_extract_audio_db_commit_failure_cleans_uploaded_audio(
+    db_session_factory,
+    fake_storage_service,
+    monkeypatch,
+) -> None:
+    seed_session = db_session_factory()
+    video_id = uuid4()
+    video = Video(
+        id=video_id,
+        filename="commit-fail.mp4",
+        original_url="http://storage.local/videos/commit-fail.mp4",
+        original_object_name=f"videos/{uuid4()}/original/commit-fail.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    seed_session.add(video)
+    seed_session.commit()
+    seed_session.close()
+
+    def fake_extract_audio(_: str, output_audio_path: str) -> float:
+        Path(output_audio_path).write_bytes(b"wav-data")
+        return 91.2
+
+    monkeypatch.setattr(
+        audio_extraction_service.ffmpeg_service,
+        "extract_audio",
+        fake_extract_audio,
+    )
+
+    class SecondCommitFailingSession:
+        def __init__(self, real_session: Session) -> None:
+            self._real_session = real_session
+            self.commit_calls = 0
+
+        def commit(self) -> None:
+            self.commit_calls += 1
+            if self.commit_calls == 2:
+                raise RuntimeError("final commit failed")
+            self._real_session.commit()
+
+        def __getattr__(self, name: str):
+            return getattr(self._real_session, name)
+
+    holder: dict[str, SecondCommitFailingSession] = {}
+
+    def override_get_db():
+        wrapped_session = SecondCommitFailingSession(db_session_factory())
+        holder["session"] = wrapped_session
+        try:
+            yield wrapped_session
+        finally:
+            wrapped_session.close()
+
+    def override_get_storage_service():
+        return fake_storage_service
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_object_storage_service] = (
+        override_get_storage_service
+    )
+
+    with TestClient(app) as failing_client:
+        response = failing_client.post(f"/api/videos/{video_id}/jobs/extract-audio")
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "audio_extraction_failed",
+            "message": "Failed to extract audio.",
+        },
+    }
+    assert fake_storage_service.deleted_objects == [
+        {
+            "bucket": "videos",
+            "object_name": f"videos/{video_id}/audio/audio.wav",
+        }
+    ]
+
+    check_session = db_session_factory()
+    try:
+        saved_video = check_session.get(Video, video_id)
+        job = check_session.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.video_id == video_id,
+                ProcessingJob.job_type == PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+            )
+        ).one()
+    finally:
+        check_session.close()
+
+    assert saved_video is not None
+    assert saved_video.audio_url is None
+    assert saved_video.audio_object_name is None
+    assert saved_video.duration_seconds is None
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+    assert "final commit failed" in job.error_message
 
 
 def test_get_video_transcript_returns_empty_array_when_no_segments(

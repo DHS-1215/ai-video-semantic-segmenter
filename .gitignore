@@ -12,3 +12,6 @@ node_modules/
 dist/
 coverage/
 Thumbs.db
+
+# Local frontend env
+apps/web/.env.local

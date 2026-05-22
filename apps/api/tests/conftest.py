@@ -56,8 +56,10 @@ def db_session(db_session_factory) -> Session:
 class FakeStorageService:
     def __init__(self) -> None:
         self.uploads: list[dict[str, str | int]] = []
+        self.downloads: list[dict[str, str]] = []
         self.deleted_objects: list[dict[str, str]] = []
         self.raise_on_upload = False
+        self.raise_on_download = False
         self.raise_on_delete = False
 
     def upload_stream(
@@ -68,11 +70,12 @@ class FakeStorageService:
         data,
         length: int,
         content_type: str | None = None,
+        object_name: str | None = None,
     ) -> StoredObject:
         if self.raise_on_upload:
             raise RuntimeError("upload failed")
 
-        object_name = f"videos/{video_id}/original/{filename}"
+        resolved_object_name = object_name or f"videos/{video_id}/original/{filename}"
         bucket = "videos"
         self.uploads.append(
             {
@@ -81,14 +84,34 @@ class FakeStorageService:
                 "length": length,
                 "content_type": content_type or "",
                 "bucket": bucket,
-                "object_name": object_name,
+                "object_name": resolved_object_name,
             }
         )
         return StoredObject(
             bucket=bucket,
-            object_name=object_name,
-            url=f"http://storage.local/{bucket}/{object_name}",
+            object_name=resolved_object_name,
+            url=f"http://storage.local/{bucket}/{resolved_object_name}",
         )
+
+    def download_object(
+        self,
+        bucket: str,
+        object_name: str,
+        destination_path: str,
+    ) -> None:
+        if self.raise_on_download:
+            raise RuntimeError("download failed")
+
+        self.downloads.append(
+            {
+                "bucket": bucket,
+                "object_name": object_name,
+                "destination_path": destination_path,
+            }
+        )
+        destination = Path(destination_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"video-data")
 
     def delete_object(self, bucket: str, object_name: str) -> None:
         if self.raise_on_delete:

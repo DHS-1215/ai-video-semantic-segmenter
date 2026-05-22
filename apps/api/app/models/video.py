@@ -27,7 +27,16 @@ class Video(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     original_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    original_object_name: Mapped[str | None] = mapped_column(
+        String(2048),
+        nullable=True,
+    )
     preview_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    audio_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    audio_object_name: Mapped[str | None] = mapped_column(
+        String(2048),
+        nullable=True,
+    )
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(
         String(50),

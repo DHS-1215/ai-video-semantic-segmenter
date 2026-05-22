@@ -2,9 +2,7 @@
 
 Project skeleton for an AI video semantic segmentation system focused on splitting long-form video transcripts into semantic content segments for brand teams.
 
-This repository now includes the initial database layer for semantic video segmentation, including SQLAlchemy models and the first Alembic migration. It still does not implement video upload, AI transcription, semantic segmentation logic, or clip export behavior.
-This round adds a backend upload API that stores original video files in MinIO, creates a `videos` row, and creates a pending `mock_pipeline` processing job for later stages.
-This round also adds a frontend MVP that can upload videos, browse the video list, run the mock pipeline, and inspect Chinese mock transcript and semantic segment results.
+This repository now includes the current MVP foundation for semantic video segmentation: SQLAlchemy models and Alembic migrations, a backend upload API that stores original videos in MinIO, a synchronous mock transcript + semantic segmentation pipeline, a frontend MVP for upload/list/detail flows, and a synchronous backend audio extraction API that downloads source video from MinIO, runs local FFmpeg to extract mono 16 kHz WAV audio, uploads the extracted audio back to MinIO, and stores audio metadata on the `videos` row.
 
 ## Repository Layout
 
@@ -28,6 +26,7 @@ packages/
 - Node.js 16.14+
 - npm 8+
 - Docker Desktop
+- FFmpeg and ffprobe available on `PATH`
 
 ## Environment Setup
 
@@ -123,6 +122,14 @@ curl -X POST http://localhost:8000/api/videos/upload ^
   -F "file=@C:\path\to\example.mp4"
 ```
 
+Audio extraction example:
+
+```powershell
+curl -X POST http://localhost:8000/api/videos/{video_id}/jobs/extract-audio
+```
+
+The audio extraction endpoint requires local `ffmpeg` and `ffprobe`. It only extracts audio in this round and does not run ASR, LLM semantic segmentation, clip export, or Celery tasks.
+
 ### Web
 
 ```powershell
@@ -187,6 +194,7 @@ pytest
 - Core SQLAlchemy tables are defined for videos, transcript segments, semantic segments, video clips, and processing jobs.
 - Alembic includes an initial `create_core_tables` migration.
 - `POST /api/videos/upload` stores the original video in MinIO, creates a `videos` record, and creates one pending `mock_pipeline` processing job.
+- `POST /api/videos/{video_id}/jobs/extract-audio` downloads the original MinIO object, extracts mono 16 kHz WAV audio with FFmpeg, uploads the generated audio back to MinIO, and stores audio metadata on the `videos` row.
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` runs a synchronous mock transcript + semantic segmentation pipeline for product-loop validation.
 - `GET /api/videos` lists uploaded videos ordered by `created_at` descending.
 - `GET /api/videos/{video_id}` returns one video record.
@@ -203,9 +211,11 @@ Detailed API note: see `docs/api.md`.
 ## Current Limitations
 
 - No real ASR pipeline
+- No real audio-to-text pipeline yet after extraction
 - No real semantic segmentation AI workflow yet
 - No video clip export pipeline yet
 - Uploading a video only creates a pending `mock_pipeline` job until the mock pipeline endpoint is called
+- Audio extraction runs synchronously in the API process and is not queued through Celery yet
 - The mock pipeline produces synthetic transcript and semantic segment data for product validation only
 - No real video preview or player
 - No real background processing pipeline

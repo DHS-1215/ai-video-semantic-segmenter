@@ -9,14 +9,23 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_object_storage_service
 from app.core.config import get_settings
-from app.core.constants import JOB_STATUS_PENDING, PROCESSING_JOB_TYPE_MOCK_PIPELINE, VIDEO_STATUS_PENDING
+from app.core.constants import (
+    JOB_STATUS_PENDING,
+    PROCESSING_JOB_TYPE_MOCK_PIPELINE,
+    VIDEO_STATUS_PENDING,
+)
 from app.core.errors import APIError
 from app.models import ProcessingJob, SemanticSegment, TranscriptSegment, Video
 from app.schemas.common import ErrorResponse, SuccessResponse
-from app.schemas.job import MockPipelineResponse, ProcessingJobResponse
+from app.schemas.job import (
+    AudioExtractionResponse,
+    MockPipelineResponse,
+    ProcessingJobResponse,
+)
 from app.schemas.semantic import SemanticSegmentResponse
 from app.schemas.transcript import TranscriptSegmentResponse
 from app.schemas.video import VideoListItem, VideoResponse, VideoUploadResponse
+from app.services.audio_extraction import extract_audio_for_video
 from app.services.mock_pipeline import run_mock_pipeline
 from app.services.storage import ObjectStorageService, StoredObject, make_safe_filename
 
@@ -86,7 +95,10 @@ def upload_video(
         id=video_id,
         filename=safe_filename,
         original_url=stored_object.url,
+        original_object_name=stored_object.object_name,
         preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
         duration_seconds=None,
         status=VIDEO_STATUS_PENDING,
     )
@@ -132,6 +144,29 @@ def trigger_mock_pipeline(
     video = _get_video_or_404(db, video_id)
     result = run_mock_pipeline(db, video)
     return SuccessResponse(data=MockPipelineResponse(**result))
+
+
+@router.post(
+    "/{video_id}/jobs/extract-audio",
+    response_model=SuccessResponse[AudioExtractionResponse],
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+def trigger_audio_extraction(
+    video_id: UUID,
+    db: Session = Depends(get_db),
+    storage_service: ObjectStorageService = Depends(get_object_storage_service),
+) -> SuccessResponse[AudioExtractionResponse]:
+    video = _get_video_or_404(db, video_id)
+    result = extract_audio_for_video(
+        db=db,
+        video=video,
+        storage_service=storage_service,
+    )
+    return SuccessResponse(data=AudioExtractionResponse(**result))
 
 
 @router.get(

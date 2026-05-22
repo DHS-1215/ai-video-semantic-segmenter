@@ -45,23 +45,46 @@ class ObjectStorageService:
         data: BinaryIO,
         length: int,
         content_type: str | None = None,
+        object_name: str | None = None,
     ) -> StoredObject:
         safe_filename = make_safe_filename(filename)
-        object_name = f"videos/{video_id}/original/{safe_filename}"
+        resolved_object_name = object_name or f"videos/{video_id}/original/{safe_filename}"
 
         self.ensure_bucket_exists()
-        self.client.put_object(
-            bucket_name=self.bucket_name,
-            object_name=object_name,
-            data=data,
-            length=length,
-            content_type=content_type or "application/octet-stream",
-        )
+        try:
+            self.client.put_object(
+                bucket_name=self.bucket_name,
+                object_name=resolved_object_name,
+                data=data,
+                length=length,
+                content_type=content_type or "application/octet-stream",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to upload object {self.bucket_name}/{resolved_object_name}: {exc}"
+            ) from exc
         return StoredObject(
             bucket=self.bucket_name,
-            object_name=object_name,
-            url=self.build_object_url(object_name),
+            object_name=resolved_object_name,
+            url=self.build_object_url(resolved_object_name),
         )
+
+    def download_object(
+        self,
+        bucket: str,
+        object_name: str,
+        destination_path: str,
+    ) -> None:
+        try:
+            self.client.fget_object(
+                bucket_name=bucket,
+                object_name=object_name,
+                file_path=destination_path,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to download object {bucket}/{object_name}: {exc}"
+            ) from exc
 
     def delete_object(self, bucket: str, object_name: str) -> None:
         self.client.remove_object(bucket, object_name)

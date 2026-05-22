@@ -21,3 +21,11 @@ class MockPipelineResponse(BaseModel):
     transcript_segments_created: int
     semantic_segments_created: int
     job_status: str
+
+
+class AudioExtractionResponse(BaseModel):
+    video_id: UUID
+    job_status: str
+    audio_url: str
+    audio_object_name: str
+    duration_seconds: float

@@ -30,6 +30,7 @@ Behavior:
 - Uploads the original file to MinIO
 - Creates a `videos` row
 - Creates a pending `processing_jobs` row with `job_type = "mock_pipeline"`
+- Stores `original_object_name` for later real media processing
 
 Example success response:
 
@@ -84,6 +85,12 @@ Returns a single video record. Missing IDs return:
 }
 ```
 
+The detail payload now also includes:
+
+- `original_object_name`
+- `audio_url`
+- `audio_object_name`
+
 ### `GET /api/videos/{video_id}/transcript`
 
 Returns transcript segments ordered by `sort_order` ascending. If the video exists but no transcript has been created yet, the endpoint returns an empty array.
@@ -114,6 +121,38 @@ Example response:
 }
 ```
 
+### `POST /api/videos/{video_id}/jobs/extract-audio`
+
+Downloads the original video from MinIO, extracts mono 16 kHz WAV audio with local `ffmpeg`, uploads the extracted audio back to MinIO, and records the resulting audio metadata on the `videos` row.
+
+Requirements:
+
+- `video.original_object_name` must exist, otherwise the API returns `400 missing_original_object`
+- `ffmpeg` and `ffprobe` must be installed locally and available on `PATH`
+
+Behavior:
+
+- Reuses or creates a `processing_jobs` row with `job_type = "extract_audio"`
+- Sets job status `running -> completed` on success
+- Stores `audio_url`, `audio_object_name`, and `duration_seconds` on the `videos` row
+- Returns `500 audio_extraction_failed` if MinIO download, `ffmpeg`, upload, or final database persistence fails
+- This round only extracts audio; it does not run ASR, LLM segmentation, clip export, or Celery jobs
+
+Example success response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "video_id": "d828ea75-bd27-4cbf-9fd3-4c480d9a577c",
+    "job_status": "completed",
+    "audio_url": "http://localhost:9000/videos/videos/d828ea75-bd27-4cbf-9fd3-4c480d9a577c/audio/audio.wav",
+    "audio_object_name": "videos/d828ea75-bd27-4cbf-9fd3-4c480d9a577c/audio/audio.wav",
+    "duration_seconds": 420.0
+  }
+}
+```
+
 ### `GET /api/videos/{video_id}/segments`
 
 Returns semantic segments ordered by `sort_order` ascending.
@@ -124,6 +163,8 @@ Returns processing jobs ordered by `created_at` descending.
 
 ## Scope
 
-- This round does not implement ASR, real LLM semantic segmentation, FFmpeg, Celery processing, or clip export.
+- This round adds synchronous FFmpeg-based audio extraction only.
+- This round does not implement ASR, real LLM semantic segmentation, Celery processing, or clip export.
 - The transcript and semantic segment data returned by the mock pipeline are synthetic Chinese fixtures for product loop validation in a brand-team scenario only.
 - Uploading a video only stores the original file and creates a pending `mock_pipeline` job for future processing stages.
+- Audio extraction does not trigger ASR or semantic segmentation yet.
