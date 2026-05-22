@@ -12,6 +12,7 @@ import {
   getTranscript,
   getVideo,
   runMockPipeline,
+  transcribeAudio,
   type ProcessingJob,
   type SemanticSegment,
   type TranscriptSegment,
@@ -49,6 +50,7 @@ export default function VideoDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRunningPipeline, setIsRunningPipeline] = useState(false);
   const [isExtractingAudio, setIsExtractingAudio] = useState(false);
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
@@ -159,29 +161,86 @@ export default function VideoDetailPage() {
     }
   }
 
+  async function handleTranscribeAudio() {
+    if (!videoId) {
+      return;
+    }
+
+    if (
+      transcript.length > 0 &&
+      !window.confirm(
+        "\u91cd\u65b0\u751f\u6210\u4f1a\u8986\u76d6\u5f53\u524d\u8f6c\u5199\u6587\u672c\uff0c\u662f\u5426\u7ee7\u7eed\uff1f",
+      )
+    ) {
+      return;
+    }
+
+    setIsTranscribingAudio(true);
+    setActionMessage(null);
+    setErrorMessage(null);
+
+    try {
+      const result = await transcribeAudio(videoId);
+      setActionMessage(
+        `\u8f6c\u5199\u5df2\u5b8c\u6210\uff1a\u751f\u6210 ${result.transcript_segments_created} \u6761\u8f6c\u5199\u6587\u672c\u3002`,
+      );
+      await loadVideoData({ preserveData: true });
+    } catch (error) {
+      if (error instanceof ApiClientError) {
+        setErrorMessage(error.message);
+      } else {
+        setErrorMessage("\u751f\u6210\u8f6c\u5199\u5931\u8d25\u3002");
+      }
+    } finally {
+      setIsTranscribingAudio(false);
+    }
+  }
+
   function getJobTypeLabel(job: ProcessingJob): string {
     if (job.job_type === "extract_audio") {
       return "\u63d0\u53d6\u97f3\u9891";
+    }
+
+    if (job.job_type === "transcribe_audio") {
+      return "\u751f\u6210\u8f6c\u5199";
     }
 
     return job.job_type;
   }
 
   function getJobStatusLabel(job: ProcessingJob): string {
-    if (job.job_type !== "extract_audio") {
+    if (job.job_type === "extract_audio") {
+      if (job.status === "completed") {
+        return "\u97f3\u9891\u63d0\u53d6\u5b8c\u6210";
+      }
+
+      if (job.status === "failed") {
+        return "\u97f3\u9891\u63d0\u53d6\u5931\u8d25";
+      }
+
+      if (job.status === "running") {
+        return "\u97f3\u9891\u63d0\u53d6\u4e2d";
+      }
+
       return job.status;
     }
 
-    if (job.status === "completed") {
-      return "\u97f3\u9891\u63d0\u53d6\u5b8c\u6210";
-    }
+    if (job.job_type === "transcribe_audio") {
+      if (job.status === "completed") {
+        return "\u8f6c\u5199\u5b8c\u6210";
+      }
 
-    if (job.status === "failed") {
-      return "\u97f3\u9891\u63d0\u53d6\u5931\u8d25";
-    }
+      if (job.status === "failed") {
+        return "\u8f6c\u5199\u5931\u8d25";
+      }
 
-    if (job.status === "running") {
-      return "\u97f3\u9891\u63d0\u53d6\u4e2d";
+      if (job.status === "running") {
+        return "\u8f6c\u5199\u4e2d";
+      }
+
+      if (job.status === "pending") {
+        return "\u7b49\u5f85\u8f6c\u5199";
+      }
     }
 
     return job.status;
@@ -193,10 +252,14 @@ export default function VideoDetailPage() {
   const hasExistingResults = hasTranscript || hasSegments;
   const shouldShowGenerationGuide = !hasTranscript && !hasSegments;
   const canExtractAudio = Boolean(video?.original_object_name);
+  const canTranscribeAudio = Boolean(video?.audio_object_name);
   const hasExtractedAudio = Boolean(video?.audio_object_name);
   const pipelineButtonLabel = hasExistingResults
     ? "\u91cd\u65b0\u8fd0\u884c Mock Pipeline"
     : "\u8fd0\u884c Mock Pipeline";
+  const transcriptionButtonLabel = hasTranscript
+    ? "\u91cd\u65b0\u751f\u6210\u8f6c\u5199"
+    : "\u751f\u6210\u8f6c\u5199";
 
   const steps: StepItem[] = [
     {
@@ -302,11 +365,26 @@ export default function VideoDetailPage() {
                       ? "\u63d0\u53d6\u4e2d..."
                       : "\u63d0\u53d6\u97f3\u9891"}
                   </button>
+                  <button
+                    className="secondary-button"
+                    disabled={!canTranscribeAudio || isTranscribingAudio}
+                    onClick={handleTranscribeAudio}
+                    type="button"
+                  >
+                    {isTranscribingAudio
+                      ? "\u751f\u6210\u8f6c\u5199\u4e2d..."
+                      : transcriptionButtonLabel}
+                  </button>
                   {!canExtractAudio ? (
                     <p className="detail-action-hint">
                       {
                         "\u5386\u53f2\u4e0a\u4f20\u8bb0\u5f55\u7f3a\u5c11 original_object_name\uff0c\u8bf7\u91cd\u65b0\u4e0a\u4f20\u89c6\u9891\u3002"
                       }
+                    </p>
+                  ) : null}
+                  {!canTranscribeAudio ? (
+                    <p className="detail-action-hint">
+                      {"\u8bf7\u5148\u63d0\u53d6\u97f3\u9891\u3002"}
                     </p>
                   ) : null}
                 </div>
@@ -367,7 +445,7 @@ export default function VideoDetailPage() {
             {shouldShowGenerationGuide ? (
               <div className="empty-state guide-card">
                 {
-                  "\u5f53\u524d\u89c6\u9891\u8fd8\u6ca1\u6709\u751f\u6210\u8f6c\u5199\u548c\u8bed\u4e49\u5206\u6bb5\u3002\u70b9\u51fb\u201c\u8fd0\u884c Mock Pipeline\u201d\u751f\u6210\u4e2d\u6587\u6a21\u62df\u7ed3\u679c\uff0c\u7528\u4e8e\u9a8c\u8bc1\u4ea7\u54c1\u6d41\u7a0b\u3002"
+                  "\u5f53\u524d\u89c6\u9891\u8fd8\u6ca1\u6709\u751f\u6210\u8f6c\u5199\u548c\u8bed\u4e49\u5206\u6bb5\u3002\u53ef\u4ee5\u5148\u63d0\u53d6\u97f3\u9891\u518d\u751f\u6210\u8f6c\u5199\uff0c\u4e5f\u53ef\u4ee5\u76f4\u63a5\u8fd0\u884c Mock Pipeline \u9a8c\u8bc1\u6f14\u793a\u6d41\u7a0b\u3002"
                 }
               </div>
             ) : null}
@@ -412,7 +490,9 @@ export default function VideoDetailPage() {
               </div>
               {transcript.length === 0 ? (
                 <div className="empty-state">
-                  {"\u8fd8\u6ca1\u6709\u8f6c\u5199\u7ed3\u679c\uff0c\u5148\u8fd0\u884c Mock Pipeline\u3002"}
+                  {
+                    "\u8fd8\u6ca1\u6709\u8f6c\u5199\u7ed3\u679c\uff0c\u53ef\u4ee5\u5148\u63d0\u53d6\u97f3\u9891\u5e76\u751f\u6210\u8f6c\u5199\uff0c\u6216\u8005\u8fd0\u884c Mock Pipeline\u3002"
+                  }
                 </div>
               ) : (
                 <div className="stack-list">

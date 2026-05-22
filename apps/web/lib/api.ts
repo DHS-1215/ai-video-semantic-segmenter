@@ -90,6 +90,12 @@ export type AudioExtractionResult = {
   duration_seconds: number;
 };
 
+export type TranscriptionResult = {
+  video_id: string;
+  transcript_segments_created: number;
+  job_status: string;
+};
+
 export class ApiClientError extends Error {
   code: string;
   status: number;
@@ -182,6 +188,17 @@ export async function extractAudio(
 ): Promise<AudioExtractionResult> {
   return request<AudioExtractionResult>(
     `/api/videos/${videoId}/jobs/extract-audio`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export async function transcribeAudio(
+  videoId: string,
+): Promise<TranscriptionResult> {
+  return request<TranscriptionResult>(
+    `/api/videos/${videoId}/jobs/transcribe-audio`,
     {
       method: "POST",
     },

@@ -29,3 +29,9 @@ class AudioExtractionResponse(BaseModel):
     audio_url: str
     audio_object_name: str
     duration_seconds: float
+
+
+class TranscriptionResponse(BaseModel):
+    video_id: UUID
+    transcript_segments_created: int
+    job_status: str

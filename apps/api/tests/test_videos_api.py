@@ -7,13 +7,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_object_storage_service
+from app.api.deps import get_asr_provider, get_db, get_object_storage_service
 from app.core.constants import (
     JOB_STATUS_COMPLETED,
     JOB_STATUS_FAILED,
     JOB_STATUS_PENDING,
     PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
     PROCESSING_JOB_TYPE_MOCK_PIPELINE,
+    PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
 )
 from app.main import app
 from app.models import ProcessingJob, TranscriptSegment, Video
@@ -305,6 +306,19 @@ def test_extract_audio_requires_video(client: TestClient) -> None:
     }
 
 
+def test_transcribe_audio_requires_video(client: TestClient) -> None:
+    response = client.post(f"/api/videos/{uuid4()}/jobs/transcribe-audio")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "video_not_found",
+            "message": "Video not found.",
+        },
+    }
+
+
 def test_extract_audio_requires_original_object_name(
     client: TestClient,
     db_session: Session,
@@ -338,6 +352,45 @@ def test_extract_audio_requires_original_object_name(
             select(func.count(ProcessingJob.id)).where(
                 ProcessingJob.video_id == video.id,
                 ProcessingJob.job_type == PROCESSING_JOB_TYPE_EXTRACT_AUDIO,
+            )
+        )
+        == 0
+    )
+
+
+def test_transcribe_audio_requires_audio_object_name(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="no-audio.mp4",
+        original_url="http://storage.local/videos/no-audio.mp4",
+        original_object_name="videos/example/original/no-audio.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "missing_audio_object",
+            "message": "Video audio object is missing.",
+        },
+    }
+    assert (
+        db_session.scalar(
+            select(func.count(ProcessingJob.id)).where(
+                ProcessingJob.video_id == video.id,
+                ProcessingJob.job_type == PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
             )
         )
         == 0
@@ -408,6 +461,157 @@ def test_extract_audio_success_updates_video_and_job(
     assert fake_storage_service.uploads[-1]["object_name"] == (
         f"videos/{video.id}/audio/audio.wav"
     )
+
+
+def test_transcribe_audio_success_creates_transcript_segments(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="transcribe.mp4",
+        original_url="http://storage.local/videos/transcribe.mp4",
+        original_object_name="videos/example/original/transcribe.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "transcript_segments_created": 10,
+        "job_status": JOB_STATUS_COMPLETED,
+    }
+
+    transcript_segments = db_session.scalars(
+        select(TranscriptSegment)
+        .where(TranscriptSegment.video_id == video.id)
+        .order_by(TranscriptSegment.sort_order.asc())
+    ).all()
+    assert len(transcript_segments) == 10
+    assert [segment.sort_order for segment in transcript_segments] == list(
+        range(1, 11)
+    )
+    assert transcript_segments[0].start_time == 0.0
+    assert transcript_segments[-1].end_time == 420.0
+    assert all(segment.text.strip() for segment in transcript_segments)
+
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_COMPLETED
+    assert job.error_message is None
+
+
+def test_transcribe_audio_is_idempotent_for_transcripts(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="transcribe-idempotent.mp4",
+        original_url="http://storage.local/videos/transcribe-idempotent.mp4",
+        original_object_name="videos/example/original/transcribe-idempotent.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    first_response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+    second_response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert (
+        db_session.scalar(
+            select(func.count(TranscriptSegment.id)).where(
+                TranscriptSegment.video_id == video.id
+            )
+        )
+        == 10
+    )
+    assert (
+        db_session.scalar(
+            select(func.count(ProcessingJob.id)).where(
+                ProcessingJob.video_id == video.id,
+                ProcessingJob.job_type == PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
+            )
+        )
+        == 1
+    )
+
+
+def test_transcribe_audio_provider_failure_marks_job_failed(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="provider-fail.mp4",
+        original_url="http://storage.local/videos/provider-fail.mp4",
+        original_object_name="videos/example/original/provider-fail.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    class FailingASRProvider:
+        def transcribe(self, audio_object_name: str):
+            raise RuntimeError(f"provider failed for {audio_object_name}")
+
+    app.dependency_overrides[get_asr_provider] = lambda: FailingASRProvider()
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+    finally:
+        app.dependency_overrides.pop(get_asr_provider, None)
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "audio_transcription_failed",
+            "message": "Failed to transcribe audio.",
+        },
+    }
+    assert (
+        db_session.scalar(
+            select(func.count(TranscriptSegment.id)).where(
+                TranscriptSegment.video_id == video.id
+            )
+        )
+        == 0
+    )
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+    assert "provider failed" in job.error_message
 
 
 def test_extract_audio_storage_download_failure_marks_job_failed(
