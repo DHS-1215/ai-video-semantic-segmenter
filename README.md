@@ -6,7 +6,7 @@ This repository currently includes:
 
 - SQLAlchemy models and Alembic migrations for the core MVP tables
 - A backend upload API that stores original videos in MinIO
-- A synchronous mock ASR transcription API that turns extracted audio into `transcript_segments`
+- A configurable ASR transcription API that can use `MockASRProvider` or local Faster-Whisper
 - A synchronous mock transcript and semantic segmentation pipeline
 - A frontend MVP for upload, list, and detail flows
 - A synchronous backend audio extraction API that downloads source video from MinIO, runs local FFmpeg to extract mono 16 kHz WAV audio, uploads the extracted audio back to MinIO, and stores audio metadata on the `videos` row
@@ -40,6 +40,7 @@ packages/
 1. Copy `.env.example` to `.env`.
 2. Adjust credentials or ports if needed.
 3. Confirm `BACKEND_CORS_ORIGINS` includes your frontend origin, such as `http://localhost:3000`.
+4. Keep `ASR_PROVIDER=mock` for normal development, or switch to `ASR_PROVIDER=faster_whisper` only when you want local real ASR.
 
 ## Install Dependencies
 
@@ -148,9 +149,9 @@ curl -X POST http://localhost:8000/api/videos/{video_id}/jobs/semantic-segmentat
 ```
 
 The audio extraction endpoint requires local `ffmpeg` and `ffprobe`.
-The transcription endpoint currently uses `MockASRProvider` only.
+The transcription endpoint supports `ASR_PROVIDER=mock` or `ASR_PROVIDER=faster_whisper`.
 The semantic segmentation endpoint currently uses `MockSemanticSegmenterProvider` only.
-This round does not run any real ASR, LLM semantic segmentation, clip export, or Celery tasks.
+This round does not run any paid ASR, real LLM semantic segmentation, clip export, or Celery tasks.
 
 ### Web
 
@@ -193,8 +194,32 @@ Current synchronous processing path:
 
 1. Upload video
 2. Extract audio
-3. Generate transcript with `MockASRProvider`
+3. Generate transcript with the configured ASR provider
 4. Generate semantic segments with `MockSemanticSegmenterProvider`
+
+## Local Faster-Whisper ASR
+
+Default development mode keeps `ASR_PROVIDER=mock`, which avoids local model loading and is better for API and UI debugging.
+
+To enable local real ASR, set the following values in the repository root `.env`:
+
+```dotenv
+ASR_PROVIDER=faster_whisper
+FASTER_WHISPER_MODEL_SIZE=base
+FASTER_WHISPER_DEVICE=cpu
+FASTER_WHISPER_COMPUTE_TYPE=int8
+FASTER_WHISPER_LANGUAGE=zh
+FASTER_WHISPER_BEAM_SIZE=5
+```
+
+Notes:
+
+- `faster_whisper` runs locally and does not create paid API usage.
+- The first run may download or load the selected model, so startup latency depends on model size and machine performance.
+- If your machine is weaker, start with `tiny` or `base`.
+- For routine development and smoke tests, `mock` remains the safer default.
+- On Windows, confirm `ffmpeg` and `ffprobe` are already available on `PATH` before trying the real ASR flow.
+- Depending on your Python environment, `faster-whisper` may require compatible local runtime libraries from its upstream dependencies.
 
 ## Audio Extraction Smoke Test
 
@@ -245,7 +270,7 @@ pytest
 - Alembic includes the initial core tables migration and the video audio metadata migration.
 - `POST /api/videos/upload` stores the original video in MinIO, creates a `videos` record, and creates one pending `mock_pipeline` processing job.
 - `POST /api/videos/{video_id}/jobs/extract-audio` downloads the original MinIO object, extracts mono 16 kHz WAV audio with FFmpeg, uploads the generated audio back to MinIO, and stores audio metadata on the `videos` row.
-- `POST /api/videos/{video_id}/jobs/transcribe-audio` reads `audio_object_name`, runs `MockASRProvider`, and writes transcript rows into `transcript_segments`.
+- `POST /api/videos/{video_id}/jobs/transcribe-audio` reads `audio_object_name`, then uses the configured ASR provider to write transcript rows into `transcript_segments`.
 - `POST /api/videos/{video_id}/jobs/semantic-segmentation` reads `transcript_segments`, runs `MockSemanticSegmenterProvider`, and writes semantic rows into `semantic_segments`.
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` runs a synchronous mock transcript and semantic segmentation pipeline for product-loop validation.
 - `GET /api/videos` lists uploaded videos ordered by `created_at` descending.
@@ -254,7 +279,7 @@ pytest
 - `GET /api/videos/{video_id}/segments` returns mock semantic segments in `sort_order` order.
 - `GET /api/videos/{video_id}/jobs` returns processing jobs for the video.
 - The frontend MVP includes `/`, `/videos`, and `/videos/{id}` pages that call the existing backend APIs directly.
-- The frontend can now trigger synchronous audio extraction, mock transcription, and mock semantic segmentation from the detail page.
+- The frontend can now trigger synchronous audio extraction, configured ASR transcription, and mock semantic segmentation from the detail page.
 - The frontend expects `NEXT_PUBLIC_API_BASE_URL` to point at the running FastAPI service.
 - Celery wiring is scaffolded, but no real video-processing tasks are implemented.
 
@@ -262,8 +287,8 @@ Detailed API note: see `docs/api.md`.
 
 ## Current Limitations
 
-- No real ASR pipeline
-- Mock transcription uses `MockASRProvider` only and does not call any real ASR service
+- Real transcription currently supports local Faster-Whisper only; no paid cloud ASR is integrated
+- Default development transcription still uses `MockASRProvider`
 - No real semantic segmentation AI workflow yet
 - Semantic segmentation uses `MockSemanticSegmenterProvider` only and does not call any real LLM service
 - No video clip export pipeline yet

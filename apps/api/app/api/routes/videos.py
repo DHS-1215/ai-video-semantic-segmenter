@@ -193,12 +193,14 @@ def trigger_audio_transcription(
     video_id: UUID,
     db: Session = Depends(get_db),
     asr_provider: ASRProvider = Depends(get_asr_provider),
+    storage_service: ObjectStorageService = Depends(get_object_storage_service),
 ) -> SuccessResponse[TranscriptionResponse]:
     video = _get_video_or_404(db, video_id)
     result = transcribe_audio_for_video(
         db=db,
         video=video,
         asr_provider=asr_provider,
+        storage_service=storage_service,
     )
     return SuccessResponse(data=TranscriptionResponse(**result))
 

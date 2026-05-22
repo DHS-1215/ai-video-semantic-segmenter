@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     allowed_video_extensions: list[str] = Field(
         default_factory=lambda: ["mp4", "mov", "webm", "mkv"]
     )
+    asr_provider: str = "mock"
+    faster_whisper_model_size: str = "base"
+    faster_whisper_device: str = "cpu"
+    faster_whisper_compute_type: str = "int8"
+    faster_whisper_language: str = "zh"
+    faster_whisper_beam_size: int = 5
 
     model_config = SettingsConfigDict(
         env_file=REPO_ROOT / ".env",

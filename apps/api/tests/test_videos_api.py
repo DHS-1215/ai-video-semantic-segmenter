@@ -25,6 +25,7 @@ from app.core.constants import (
 from app.main import app
 from app.models import ProcessingJob, SemanticSegment, TranscriptSegment, Video
 from app.services import audio_extraction as audio_extraction_service
+from app.services.asr import TranscriptResultSegment
 
 
 def _build_transcript_segments(
@@ -504,9 +505,10 @@ def test_extract_audio_success_updates_video_and_job(
     )
 
 
-def test_transcribe_audio_success_creates_transcript_segments(
+def test_transcribe_audio_with_mock_provider_still_works(
     client: TestClient,
     db_session: Session,
+    fake_storage_service,
 ) -> None:
     video = Video(
         id=uuid4(),
@@ -545,6 +547,7 @@ def test_transcribe_audio_success_creates_transcript_segments(
     assert transcript_segments[0].start_time == 0.0
     assert transcript_segments[-1].end_time == 420.0
     assert all(segment.text.strip() for segment in transcript_segments)
+    assert fake_storage_service.downloads == []
 
     job = db_session.scalars(
         select(ProcessingJob).where(
@@ -653,6 +656,143 @@ def test_transcribe_audio_provider_failure_marks_job_failed(
     assert job.status == JOB_STATUS_FAILED
     assert job.error_message is not None
     assert "provider failed" in job.error_message
+
+
+def test_transcribe_audio_provider_requiring_local_file_downloads_audio(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="local-asr.mp4",
+        original_url="http://storage.local/videos/local-asr.mp4",
+        original_object_name="videos/example/original/local-asr.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=64.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    class LocalFileASRProvider:
+        requires_local_file = True
+
+        def __init__(self) -> None:
+            self.audio_path: str | None = None
+
+        def transcribe(self, audio_path: str):
+            self.audio_path = audio_path
+            assert Path(audio_path).exists()
+            return [
+                TranscriptResultSegment(
+                    start_time=0.0,
+                    end_time=8.0,
+                    speaker="Speaker 1",
+                    text="本地音频文件转写第一段",
+                ),
+                TranscriptResultSegment(
+                    start_time=8.0,
+                    end_time=16.0,
+                    speaker="Speaker 1",
+                    text="本地音频文件转写第二段",
+                ),
+            ]
+
+    provider = LocalFileASRProvider()
+    app.dependency_overrides[get_asr_provider] = lambda: provider
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+    finally:
+        app.dependency_overrides.pop(get_asr_provider, None)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "transcript_segments_created": 2,
+        "job_status": JOB_STATUS_COMPLETED,
+    }
+    assert provider.audio_path is not None
+    assert len(fake_storage_service.downloads) == 1
+    assert fake_storage_service.downloads[0]["bucket"] == "videos"
+    assert fake_storage_service.downloads[0]["object_name"] == video.audio_object_name
+
+    transcript_segments = db_session.scalars(
+        select(TranscriptSegment)
+        .where(TranscriptSegment.video_id == video.id)
+        .order_by(TranscriptSegment.sort_order.asc())
+    ).all()
+    assert [segment.sort_order for segment in transcript_segments] == [1, 2]
+    assert [segment.text for segment in transcript_segments] == [
+        "本地音频文件转写第一段",
+        "本地音频文件转写第二段",
+    ]
+
+
+def test_transcribe_audio_local_provider_failure_marks_job_failed(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="local-asr-fail.mp4",
+        original_url="http://storage.local/videos/local-asr-fail.mp4",
+        original_object_name="videos/example/original/local-asr-fail.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=64.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    class FailingLocalFileASRProvider:
+        requires_local_file = True
+
+        def transcribe(self, audio_path: str):
+            assert Path(audio_path).exists()
+            raise RuntimeError(f"local asr failed for {audio_path}")
+
+    app.dependency_overrides[get_asr_provider] = lambda: FailingLocalFileASRProvider()
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/transcribe-audio")
+    finally:
+        app.dependency_overrides.pop(get_asr_provider, None)
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "audio_transcription_failed",
+            "message": "Failed to transcribe audio.",
+        },
+    }
+    assert len(fake_storage_service.downloads) == 1
+    assert (
+        db_session.scalar(
+            select(func.count(TranscriptSegment.id)).where(
+                TranscriptSegment.video_id == video.id
+            )
+        )
+        == 0
+    )
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+    assert "local asr failed" in job.error_message
 
 
 def test_semantic_segmentation_requires_video(client: TestClient) -> None:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import UUID
 
 from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.constants import (
     JOB_STATUS_COMPLETED,
     JOB_STATUS_FAILED,
@@ -14,13 +17,15 @@ from app.core.constants import (
 )
 from app.core.errors import APIError
 from app.models import ProcessingJob, TranscriptSegment, Video
-from app.services.asr import ASRProvider
+from app.services.asr import ASRProvider, TranscriptResultSegment
+from app.services.storage import ObjectStorageService
 
 
 def transcribe_audio_for_video(
     db: Session,
     video: Video,
     asr_provider: ASRProvider,
+    storage_service: ObjectStorageService,
 ) -> dict[str, str | int | UUID]:
     if not video.audio_object_name:
         raise APIError(
@@ -38,7 +43,11 @@ def transcribe_audio_for_video(
         db.commit()
         db.refresh(job)
 
-        transcript_results = asr_provider.transcribe(video.audio_object_name)
+        transcript_results = _transcribe_audio_source(
+            video=video,
+            asr_provider=asr_provider,
+            storage_service=storage_service,
+        )
 
         db.execute(
             delete(TranscriptSegment).where(TranscriptSegment.video_id == video.id)
@@ -124,3 +133,23 @@ def _mark_job_failed(
         db.commit()
     except Exception:
         db.rollback()
+
+
+def _transcribe_audio_source(
+    *,
+    video: Video,
+    asr_provider: ASRProvider,
+    storage_service: ObjectStorageService,
+) -> list[TranscriptResultSegment]:
+    if not getattr(asr_provider, "requires_local_file", False):
+        return asr_provider.transcribe(video.audio_object_name)
+
+    settings = get_settings()
+    with TemporaryDirectory() as temp_dir:
+        audio_path = Path(temp_dir) / "audio.wav"
+        storage_service.download_object(
+            settings.minio_bucket_videos,
+            video.audio_object_name,
+            str(audio_path),
+        )
+        return asr_provider.transcribe(str(audio_path))

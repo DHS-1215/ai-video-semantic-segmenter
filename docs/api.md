@@ -97,7 +97,7 @@ Returns transcript segments ordered by `sort_order` ascending. If the video exis
 
 Current sources of transcript rows:
 
-- `POST /api/videos/{video_id}/jobs/transcribe-audio` via `MockASRProvider`
+- `POST /api/videos/{video_id}/jobs/transcribe-audio` via the configured ASR provider
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` via the existing demo pipeline
 
 ### `POST /api/videos/{video_id}/jobs/mock-pipeline`
@@ -160,7 +160,7 @@ Example success response:
 
 ### `POST /api/videos/{video_id}/jobs/transcribe-audio`
 
-Reads the extracted audio reference from `video.audio_object_name`, calls the current `MockASRProvider`, and stores transcript rows into `transcript_segments`.
+Reads the extracted audio reference from `video.audio_object_name`, calls the configured ASR provider, and stores transcript rows into `transcript_segments`.
 
 Requirements:
 
@@ -172,7 +172,11 @@ Behavior:
 - Sets job status `running -> completed` on success
 - Replaces existing transcript rows for the target video before writing the new transcript results
 - Returns `500 audio_transcription_failed` if the provider or final persistence fails
-- This round uses `MockASRProvider` only. It does not call any real ASR vendor or model service
+- Supports `ASR_PROVIDER=mock` or `ASR_PROVIDER=faster_whisper`
+- `mock` uses `MockASRProvider` and does not touch local model files
+- `faster_whisper` uses a local Faster-Whisper model and does not produce external API usage fees
+- When `faster_whisper` is enabled, the backend downloads the extracted audio to a local temp file before transcription
+- The first Faster-Whisper run may need to download or load the selected model, so startup latency depends on machine performance and model size
 
 Example success response:
 
@@ -231,8 +235,8 @@ Returns processing jobs ordered by `created_at` descending.
 
 ## Scope
 
-- This round adds synchronous FFmpeg-based audio extraction, synchronous mock-ASR transcription, and synchronous mock semantic segmentation.
-- This round does not implement any real ASR provider, real LLM semantic segmentation provider, Celery processing, or clip export.
+- This round adds synchronous FFmpeg-based audio extraction, configurable synchronous ASR transcription, and synchronous mock semantic segmentation.
+- This round does not implement any paid ASR provider, real LLM semantic segmentation provider, Celery processing, or clip export.
 - The transcript and semantic segment data returned by the mock pipeline are synthetic Chinese fixtures for product loop validation in a brand-team scenario only.
 - Uploading a video only stores the original file and creates a pending `mock_pipeline` job for future processing stages.
-- Audio extraction, mock transcription, and mock semantic segmentation remain separate API steps and are not chained automatically.
+- Audio extraction, configured ASR transcription, and mock semantic segmentation remain separate API steps and are not chained automatically.
