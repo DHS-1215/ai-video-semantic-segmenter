@@ -56,6 +56,41 @@ def test_get_asr_provider_reports_missing_faster_whisper(monkeypatch) -> None:
     assert "ASR_PROVIDER=mock" in exc_info.value.message
 
 
+def test_get_asr_provider_passes_vad_filter_setting(monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "asr_provider", "faster_whisper")
+    monkeypatch.setattr(settings, "faster_whisper_model_size", "tiny")
+    monkeypatch.setattr(settings, "faster_whisper_device", "cpu")
+    monkeypatch.setattr(settings, "faster_whisper_compute_type", "int8")
+    monkeypatch.setattr(settings, "faster_whisper_language", "zh")
+    monkeypatch.setattr(settings, "faster_whisper_beam_size", 5)
+    monkeypatch.setattr(settings, "faster_whisper_vad_filter", False)
+
+    captured: dict[str, object] = {}
+
+    def fake_cached_provider(**kwargs):
+        captured.update(kwargs)
+        return MockASRProvider()
+
+    monkeypatch.setattr(
+        asr_service,
+        "_get_cached_faster_whisper_provider",
+        fake_cached_provider,
+    )
+
+    provider = get_asr_provider()
+
+    assert isinstance(provider, MockASRProvider)
+    assert captured == {
+        "model_size": "tiny",
+        "device": "cpu",
+        "compute_type": "int8",
+        "language": "zh",
+        "beam_size": 5,
+        "vad_filter": False,
+    }
+
+
 def test_faster_whisper_provider_maps_segments_to_transcript_results() -> None:
     captured: dict[str, object] = {}
 
@@ -96,6 +131,7 @@ def test_faster_whisper_provider_maps_segments_to_transcript_results() -> None:
         compute_type="int8",
         language="zh",
         beam_size=5,
+        vad_filter=True,
         whisper_model_cls=FakeWhisperModel,
     )
 
@@ -126,4 +162,65 @@ def test_faster_whisper_provider_maps_segments_to_transcript_results() -> None:
             speaker="Speaker 1",
             text="第二段转写",
         ),
+    ]
+
+
+def test_faster_whisper_provider_can_disable_vad_filter() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeWhisperModel:
+        def __init__(self, model_size: str, *, device: str, compute_type: str) -> None:
+            captured["init"] = {
+                "model_size": model_size,
+                "device": device,
+                "compute_type": compute_type,
+            }
+
+        def transcribe(
+            self,
+            audio_path: str,
+            *,
+            language: str,
+            beam_size: int,
+            vad_filter: bool,
+        ):
+            captured["transcribe"] = {
+                "audio_path": audio_path,
+                "language": language,
+                "beam_size": beam_size,
+                "vad_filter": vad_filter,
+            }
+            return (
+                [
+                    SimpleNamespace(start=0.0, end=2.0, text="关闭 VAD 仍可转写"),
+                ],
+                SimpleNamespace(language="zh"),
+            )
+
+    provider = FasterWhisperASRProvider(
+        model_size="tiny",
+        device="cpu",
+        compute_type="int8",
+        language="zh",
+        beam_size=5,
+        vad_filter=False,
+        whisper_model_cls=FakeWhisperModel,
+    )
+
+    results = provider.transcribe("C:\\temp\\audio.wav")
+
+    assert provider.vad_filter is False
+    assert captured["transcribe"] == {
+        "audio_path": "C:\\temp\\audio.wav",
+        "language": "zh",
+        "beam_size": 5,
+        "vad_filter": False,
+    }
+    assert results == [
+        TranscriptResultSegment(
+            start_time=0.0,
+            end_time=2.0,
+            speaker="Speaker 1",
+            text="关闭 VAD 仍可转写",
+        )
     ]

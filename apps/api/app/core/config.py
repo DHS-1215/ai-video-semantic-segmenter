@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     faster_whisper_compute_type: str = "int8"
     faster_whisper_language: str = "zh"
     faster_whisper_beam_size: int = 5
+    faster_whisper_vad_filter: bool = False
 
     model_config = SettingsConfigDict(
         env_file=REPO_ROOT / ".env",

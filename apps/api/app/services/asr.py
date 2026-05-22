@@ -160,6 +160,7 @@ class FasterWhisperASRProvider:
         compute_type: str,
         language: str,
         beam_size: int,
+        vad_filter: bool,
         whisper_model_cls: type[Any] | None = None,
     ) -> None:
         self.model_size = model_size
@@ -167,6 +168,7 @@ class FasterWhisperASRProvider:
         self.compute_type = compute_type
         self.language = language
         self.beam_size = beam_size
+        self.vad_filter = vad_filter
         self._whisper_model_cls = whisper_model_cls or _load_whisper_model_cls()
         self._model = self._whisper_model_cls(
             self.model_size,
@@ -182,7 +184,7 @@ class FasterWhisperASRProvider:
             audio_source,
             language=self.language,
             beam_size=self.beam_size,
-            vad_filter=True,
+            vad_filter=self.vad_filter,
         )
 
         transcript_results: list[TranscriptResultSegment] = []
@@ -220,6 +222,7 @@ def create_asr_provider(settings: Settings) -> ASRProvider:
                 compute_type=settings.faster_whisper_compute_type,
                 language=settings.faster_whisper_language,
                 beam_size=settings.faster_whisper_beam_size,
+                vad_filter=settings.faster_whisper_vad_filter,
             )
         except RuntimeError as exc:
             raise APIError(
@@ -246,6 +249,7 @@ def _get_cached_faster_whisper_provider(
     compute_type: str,
     language: str,
     beam_size: int,
+    vad_filter: bool,
 ) -> FasterWhisperASRProvider:
     return FasterWhisperASRProvider(
         model_size=model_size,
@@ -253,6 +257,7 @@ def _get_cached_faster_whisper_provider(
         compute_type=compute_type,
         language=language,
         beam_size=beam_size,
+        vad_filter=vad_filter,
     )
 
 

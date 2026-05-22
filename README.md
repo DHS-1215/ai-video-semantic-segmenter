@@ -205,11 +205,12 @@ To enable local real ASR, set the following values in the repository root `.env`
 
 ```dotenv
 ASR_PROVIDER=faster_whisper
-FASTER_WHISPER_MODEL_SIZE=base
+FASTER_WHISPER_MODEL_SIZE=tiny
 FASTER_WHISPER_DEVICE=cpu
 FASTER_WHISPER_COMPUTE_TYPE=int8
 FASTER_WHISPER_LANGUAGE=zh
 FASTER_WHISPER_BEAM_SIZE=5
+FASTER_WHISPER_VAD_FILTER=false
 ```
 
 Notes:
@@ -218,6 +219,8 @@ Notes:
 - The first run may download or load the selected model, so startup latency depends on model size and machine performance.
 - If your machine is weaker, start with `tiny` or `base`.
 - For routine development and smoke tests, `mock` remains the safer default.
+- On Windows local development, start with `FASTER_WHISPER_VAD_FILTER=false` to avoid `onnxruntime` DLL issues blocking transcription.
+- If you want to enable VAD later, first make sure `onnxruntime` is installed and loadable in your local Python environment.
 - On Windows, confirm `ffmpeg` and `ffprobe` are already available on `PATH` before trying the real ASR flow.
 - Depending on your Python environment, `faster-whisper` may require compatible local runtime libraries from its upstream dependencies.
 

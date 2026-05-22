@@ -176,6 +176,8 @@ Behavior:
 - `mock` uses `MockASRProvider` and does not touch local model files
 - `faster_whisper` uses a local Faster-Whisper model and does not produce external API usage fees
 - When `faster_whisper` is enabled, the backend downloads the extracted audio to a local temp file before transcription
+- `faster_whisper` can keep `vad_filter` disabled by default to avoid forcing `onnxruntime` during local development
+- If Windows reports `onnxruntime` DLL load errors when VAD is enabled, set `FASTER_WHISPER_VAD_FILTER=false`
 - The first Faster-Whisper run may need to download or load the selected model, so startup latency depends on machine performance and model size
 
 Example success response:
