@@ -81,8 +81,6 @@ def segment_transcript_for_video(
             "semantic_segments_created": len(semantic_segments),
             "job_status": job.status,
         }
-    except APIError:
-        raise
     except Exception as exc:
         db.rollback()
         _mark_job_failed(
@@ -90,6 +88,8 @@ def segment_transcript_for_video(
             job_id=job.id,
             error_message=str(exc),
         )
+        if isinstance(exc, APIError):
+            raise
         raise APIError(
             500,
             "semantic_segmentation_failed",

@@ -150,7 +150,7 @@ curl -X POST http://localhost:8000/api/videos/{video_id}/jobs/semantic-segmentat
 
 The audio extraction endpoint requires local `ffmpeg` and `ffprobe`.
 The transcription endpoint supports `ASR_PROVIDER=mock` or `ASR_PROVIDER=faster_whisper`.
-The semantic segmentation endpoint currently uses `MockSemanticSegmenterProvider` only.
+The semantic segmentation endpoint supports `SEMANTIC_SEGMENTER_PROVIDER=mock` or `SEMANTIC_SEGMENTER_PROVIDER=zhipu`.
 This round does not run any paid ASR, real LLM semantic segmentation, clip export, or Celery tasks.
 
 ### Web
@@ -195,7 +195,7 @@ Current synchronous processing path:
 1. Upload video
 2. Extract audio
 3. Generate transcript with the configured ASR provider
-4. Generate semantic segments with `MockSemanticSegmenterProvider`
+4. Generate semantic segments with the configured semantic segmenter provider
 
 ## Local Faster-Whisper ASR
 
@@ -223,6 +223,53 @@ Notes:
 - If you want to enable VAD later, first make sure `onnxruntime` is installed and loadable in your local Python environment.
 - On Windows, confirm `ffmpeg` and `ffprobe` are already available on `PATH` before trying the real ASR flow.
 - Depending on your Python environment, `faster-whisper` may require compatible local runtime libraries from its upstream dependencies.
+
+## Zhipu Semantic Segmentation
+
+Default development mode keeps `SEMANTIC_SEGMENTER_PROVIDER=mock`, which avoids remote LLM calls and is better for API and UI debugging.
+
+To enable real semantic segmentation with Zhipu GLM, set the following values in the repository root `.env`:
+
+```dotenv
+SEMANTIC_SEGMENTER_PROVIDER=zhipu
+ZHIPU_API_KEY=your-zhipu-api-key
+ZHIPU_MODEL=glm-4-flash
+ZHIPU_TEMPERATURE=0.2
+ZHIPU_TIMEOUT_SECONDS=300
+```
+
+Notes:
+
+- `ZHIPU_API_KEY` must stay in local `.env` only and must not be committed.
+- The semantic segmentation API keeps the same endpoint and lets the backend provider switch decide whether to use mock or Zhipu.
+- If you only want local development and no external LLM cost, keep `SEMANTIC_SEGMENTER_PROVIDER=mock`.
+- If `SEMANTIC_SEGMENTER_PROVIDER=zhipu` but the API key is missing, the backend returns a configuration error before segment generation starts.
+- The Zhipu segmentation target is complete topic segments and clip-ready content units for brand videos, not sentence-by-sentence summaries.
+- The output must stay faithful to the ASR transcript. The provider prompt explicitly tells the model not to correct, expand, or invent facts beyond the transcript text.
+- For longer videos or denser transcript batches, start with `ZHIPU_TIMEOUT_SECONDS=300` to reduce request timeout failures.
+- If Zhipu times out, the backend returns a clearer timeout message so the detail page can show the actual failure reason.
+- If a long video returns too many segments, too many short segments, or an overly fragmented opening, the backend rejects that result instead of writing it into the database.
+
+## Zhipu Semantic Segmentation Smoke Test
+
+1. Register or log in to the Zhipu open platform.
+2. Create or copy a valid API key.
+3. Set the repository root `.env` with:
+
+```dotenv
+SEMANTIC_SEGMENTER_PROVIDER=zhipu
+ZHIPU_API_KEY=your-zhipu-api-key
+ZHIPU_MODEL=glm-4-flash
+ZHIPU_TEMPERATURE=0.2
+ZHIPU_TIMEOUT_SECONDS=300
+```
+
+4. Restart the FastAPI service after updating `.env`.
+5. Upload a new video.
+6. Extract audio.
+7. Generate transcript.
+8. Generate semantic segments.
+9. Confirm `GET /api/videos/{video_id}/segments` returns real semantic results instead of the mock grouping output.
 
 ## Audio Extraction Smoke Test
 
@@ -274,7 +321,7 @@ pytest
 - `POST /api/videos/upload` stores the original video in MinIO, creates a `videos` record, and creates one pending `mock_pipeline` processing job.
 - `POST /api/videos/{video_id}/jobs/extract-audio` downloads the original MinIO object, extracts mono 16 kHz WAV audio with FFmpeg, uploads the generated audio back to MinIO, and stores audio metadata on the `videos` row.
 - `POST /api/videos/{video_id}/jobs/transcribe-audio` reads `audio_object_name`, then uses the configured ASR provider to write transcript rows into `transcript_segments`.
-- `POST /api/videos/{video_id}/jobs/semantic-segmentation` reads `transcript_segments`, runs `MockSemanticSegmenterProvider`, and writes semantic rows into `semantic_segments`.
+- `POST /api/videos/{video_id}/jobs/semantic-segmentation` reads `transcript_segments`, then uses the configured semantic segmenter provider to write semantic rows into `semantic_segments`.
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` runs a synchronous mock transcript and semantic segmentation pipeline for product-loop validation.
 - `GET /api/videos` lists uploaded videos ordered by `created_at` descending.
 - `GET /api/videos/{video_id}` returns one video record.
@@ -282,7 +329,7 @@ pytest
 - `GET /api/videos/{video_id}/segments` returns mock semantic segments in `sort_order` order.
 - `GET /api/videos/{video_id}/jobs` returns processing jobs for the video.
 - The frontend MVP includes `/`, `/videos`, and `/videos/{id}` pages that call the existing backend APIs directly.
-- The frontend can now trigger synchronous audio extraction, configured ASR transcription, and mock semantic segmentation from the detail page.
+- The frontend can now trigger synchronous audio extraction, configured ASR transcription, and configured semantic segmentation from the detail page.
 - The frontend expects `NEXT_PUBLIC_API_BASE_URL` to point at the running FastAPI service.
 - Celery wiring is scaffolded, but no real video-processing tasks are implemented.
 
@@ -292,12 +339,12 @@ Detailed API note: see `docs/api.md`.
 
 - Real transcription currently supports local Faster-Whisper only; no paid cloud ASR is integrated
 - Default development transcription still uses `MockASRProvider`
-- No real semantic segmentation AI workflow yet
-- Semantic segmentation uses `MockSemanticSegmenterProvider` only and does not call any real LLM service
+- Real semantic segmentation currently supports Zhipu GLM only
+- Default development semantic segmentation still uses `MockSemanticSegmenterProvider`
 - No video clip export pipeline yet
 - Uploading a video only creates a pending `mock_pipeline` job until the mock pipeline endpoint is called
 - Audio extraction runs synchronously in the API process and is not queued through Celery yet
 - The mock pipeline produces synthetic transcript and semantic segment data for product validation only
 - No real video preview or player
 - No real background processing pipeline
-- No AI integrations
+- No additional AI providers beyond local Faster-Whisper ASR and Zhipu semantic segmentation

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -22,10 +23,12 @@ from app.core.constants import (
     PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
     PROCESSING_JOB_TYPE_TRANSCRIBE_AUDIO,
 )
+from app.core.errors import APIError
 from app.main import app
 from app.models import ProcessingJob, SemanticSegment, TranscriptSegment, Video
 from app.services import audio_extraction as audio_extraction_service
 from app.services.asr import TranscriptResultSegment
+from app.services.semantic_segmenter import ZhipuSemanticSegmenterProvider
 
 
 def _build_transcript_segments(
@@ -1061,6 +1064,251 @@ def test_semantic_segmentation_with_short_transcript_still_creates_segment(
     assert semantic_segments[0].sort_order == 1
     assert semantic_segments[0].transcript_text.strip()
     assert 0.0 <= semantic_segments[0].confidence <= 1.0
+
+
+def test_semantic_segmentation_with_zhipu_provider_success(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-zhipu-success.mp4",
+        original_url="http://storage.local/videos/semantic-zhipu-success.mp4",
+        original_object_name="videos/example/original/semantic-zhipu-success.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        _semantic_test_transcript_entries(),
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    def fake_client_factory(api_key: str, timeout_seconds: int):
+        class FakeCompletions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=(
+                                    '{"segments":[{"start_time":0.0,"end_time":164.0,'
+                                    '"title":"品牌视频处理现状","summary":"说明品牌团队处理长视频的当前方式与人工成本。",'
+                                    '"topic":"处理现状","keywords":["品牌","视频","人工检索"],'
+                                    '"transcript_text":"今天先从品牌团队处理长视频内容的现状讲起，我们每天都要整理发布会和访谈视频。 现在最大的成本还是人工回看视频，想找到一个完整话题往往要拖很多次时间轴。 如果只有零散片段，没有上下文，品牌审核和后续剪辑都很难判断内容是否完整。 所以第一步必须先把音频提取出来，再把说话内容整理成可阅读的转写文本。",'
+                                    '"confidence":0.91,"reason":"前四条转写连续围绕现状和痛点展开。"},'
+                                    '{"start_time":164.0,"end_time":420.0,'
+                                    '"title":"转写分段与复用价值","summary":"说明转写、语义分段和结构化输出的复用价值。",'
+                                    '"topic":"复用价值","keywords":["转写","语义分段","复用"],'
+                                    '"transcript_text":"有了转写之后，团队才能基于文本去检索关键词，而不是反复回听整段音频。 接下来语义分段要解决的问题，是把连续讨论品牌策略的内容归在同一个内容单元。 如果系统能给出每段标题、摘要和关键词，审核同学会更容易理解这段内容在讲什么。 这些结构化元数据也能帮助后续团队做素材复用，比如官网摘要、案例整理和社媒脚本。 这一轮我们先用 Mock provider 跑通接口和数据结构，确认前后端能完整消费语义分段结果。 等到抽象稳定之后，再替换成真实 LLM 服务去判断主题边界和分段理由。",'
+                                    '"confidence":0.89,"reason":"后六条转写聚焦转写分段价值和后续规划。"}]}'
+                                )
+                            )
+                        )
+                    ]
+                )
+
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions()),
+        )
+
+    provider = ZhipuSemanticSegmenterProvider(
+        api_key="test-key",
+        model="glm-4-flash",
+        temperature=0.2,
+        timeout_seconds=120,
+        client_factory=fake_client_factory,
+    )
+
+    app.dependency_overrides[get_semantic_segmenter_provider] = lambda: provider
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+    finally:
+        app.dependency_overrides.pop(get_semantic_segmenter_provider, None)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "semantic_segments_created": 2,
+        "job_status": JOB_STATUS_COMPLETED,
+    }
+
+    semantic_segments = db_session.scalars(
+        select(SemanticSegment)
+        .where(SemanticSegment.video_id == video.id)
+        .order_by(SemanticSegment.sort_order.asc())
+    ).all()
+    assert len(semantic_segments) == 2
+    assert [segment.sort_order for segment in semantic_segments] == [1, 2]
+    assert semantic_segments[0].title == "品牌视频处理现状"
+    assert semantic_segments[1].title == "转写分段与复用价值"
+    assert all(segment.transcript_text.strip() for segment in semantic_segments)
+
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_COMPLETED
+    assert job.error_message is None
+
+
+def test_semantic_segmentation_zhipu_failure_marks_job_failed(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-zhipu-fail.mp4",
+        original_url="http://storage.local/videos/semantic-zhipu-fail.mp4",
+        original_object_name="videos/example/original/semantic-zhipu-fail.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        _semantic_test_transcript_entries(),
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    provider = ZhipuSemanticSegmenterProvider(
+        api_key="test-key",
+        model="glm-4-flash",
+        temperature=0.2,
+        timeout_seconds=120,
+        client_factory=lambda api_key, timeout_seconds: SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **kwargs: SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(content="not-json")
+                            )
+                        ]
+                    )
+                )
+            )
+        ),
+    )
+
+    app.dependency_overrides[get_semantic_segmenter_provider] = lambda: provider
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+    finally:
+        app.dependency_overrides.pop(get_semantic_segmenter_provider, None)
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "semantic_segmenter_invalid_json",
+            "message": response.json()["error"]["message"],
+        },
+    }
+
+    assert (
+        db_session.scalar(
+            select(func.count(SemanticSegment.id)).where(
+                SemanticSegment.video_id == video.id
+            )
+        )
+        == 0
+    )
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message is not None
+
+
+def test_semantic_segmentation_api_returns_provider_error_message(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="semantic-zhipu-timeout.mp4",
+        original_url="http://storage.local/videos/semantic-zhipu-timeout.mp4",
+        original_object_name="videos/example/original/semantic-zhipu-timeout.mp4",
+        preview_url=None,
+        audio_url="http://storage.local/videos/videos/example/audio/audio.wav",
+        audio_object_name="videos/example/audio/audio.wav",
+        duration_seconds=420.0,
+        status="pending",
+    )
+    transcript_segments = _build_transcript_segments(
+        video,
+        _semantic_test_transcript_entries(),
+    )
+    db_session.add_all([video, *transcript_segments])
+    db_session.commit()
+
+    timeout_message = (
+        "智谱语义分段请求超时，请稍后重试，或缩短视频/增加 "
+        "ZHIPU_TIMEOUT_SECONDS。 原始错误: Request timed out."
+    )
+
+    class TimeoutSegmenterProvider:
+        def segment(
+            self,
+            transcript_segments: list[TranscriptSegment],
+        ) -> list[SemanticSegment]:
+            raise APIError(
+                500,
+                "semantic_segmenter_timeout",
+                timeout_message,
+            )
+
+    app.dependency_overrides[get_semantic_segmenter_provider] = (
+        lambda: TimeoutSegmenterProvider()
+    )
+    try:
+        response = client.post(f"/api/videos/{video.id}/jobs/semantic-segmentation")
+    finally:
+        app.dependency_overrides.pop(get_semantic_segmenter_provider, None)
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "semantic_segmenter_timeout",
+            "message": timeout_message,
+        },
+    }
+    assert (
+        db_session.scalar(
+            select(func.count(SemanticSegment.id)).where(
+                SemanticSegment.video_id == video.id
+            )
+        )
+        == 0
+    )
+
+    db_session.expire_all()
+    job = db_session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.video_id == video.id,
+            ProcessingJob.job_type == PROCESSING_JOB_TYPE_SEMANTIC_SEGMENT,
+        )
+    ).one()
+    assert job.status == JOB_STATUS_FAILED
+    assert job.error_message == timeout_message
 
 
 def test_extract_audio_storage_download_failure_marks_job_failed(

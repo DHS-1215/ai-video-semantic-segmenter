@@ -6,8 +6,8 @@ from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.services.asr import ASRProvider, create_asr_provider
 from app.services.semantic_segmenter import (
-    MockSemanticSegmenterProvider,
     SemanticSegmenterProvider,
+    create_semantic_segmenter_provider,
 )
 from app.services.storage import ObjectStorageService, get_storage_service
 
@@ -29,4 +29,4 @@ def get_asr_provider() -> ASRProvider:
 
 
 def get_semantic_segmenter_provider() -> SemanticSegmenterProvider:
-    return MockSemanticSegmenterProvider()
+    return create_semantic_segmenter_provider(get_settings())

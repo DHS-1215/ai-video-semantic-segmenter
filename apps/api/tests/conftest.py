@@ -13,10 +13,16 @@ from sqlalchemy.pool import StaticPool
 from fastapi.testclient import TestClient
 
 import app.models  # noqa: F401
-from app.api.deps import get_asr_provider, get_db, get_object_storage_service
+from app.api.deps import (
+    get_asr_provider,
+    get_db,
+    get_object_storage_service,
+    get_semantic_segmenter_provider,
+)
 from app.db.base import Base
 from app.main import app
 from app.services.asr import MockASRProvider
+from app.services.semantic_segmenter import MockSemanticSegmenterProvider
 from app.services.storage import StoredObject
 
 
@@ -146,11 +152,17 @@ def client(db_session_factory, fake_storage_service: FakeStorageService) -> Test
     def override_get_asr_provider():
         return MockASRProvider()
 
+    def override_get_semantic_segmenter_provider():
+        return MockSemanticSegmenterProvider()
+
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_object_storage_service] = (
         override_get_storage_service
     )
     app.dependency_overrides[get_asr_provider] = override_get_asr_provider
+    app.dependency_overrides[get_semantic_segmenter_provider] = (
+        override_get_semantic_segmenter_provider
+    )
 
     with TestClient(app) as test_client:
         yield test_client

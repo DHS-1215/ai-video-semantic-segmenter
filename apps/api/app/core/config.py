@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     faster_whisper_language: str = "zh"
     faster_whisper_beam_size: int = 5
     faster_whisper_vad_filter: bool = False
+    semantic_segmenter_provider: str = "mock"
+    zhipu_api_key: str = ""
+    zhipu_model: str = "glm-4-flash"
+    zhipu_temperature: float = 0.2
+    zhipu_timeout_seconds: int = 300
 
     model_config = SettingsConfigDict(
         env_file=REPO_ROOT / ".env",

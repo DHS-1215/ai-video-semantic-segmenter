@@ -195,7 +195,7 @@ Example success response:
 
 ### `POST /api/videos/{video_id}/jobs/semantic-segmentation`
 
-Reads the current `transcript_segments` for the target video, calls `MockSemanticSegmenterProvider`, and stores semantic rows into `semantic_segments`.
+Reads the current `transcript_segments` for the target video, calls the configured semantic segmenter provider, and stores semantic rows into `semantic_segments`.
 
 Requirements:
 
@@ -207,7 +207,17 @@ Behavior:
 - Sets job status `running -> completed` on success
 - Replaces existing semantic segment rows for the target video before writing the new segmentation results
 - Returns `500 semantic_segmentation_failed` if the provider or final persistence fails
-- This round uses `MockSemanticSegmenterProvider` only. It does not call any real LLM vendor or local model
+- Supports `SEMANTIC_SEGMENTER_PROVIDER=mock` or `SEMANTIC_SEGMENTER_PROVIDER=zhipu`
+- `mock` uses `MockSemanticSegmenterProvider` and does not call any external LLM API
+- `zhipu` uses Zhipu GLM Chat Completions and requires `ZHIPU_API_KEY`
+- If `SEMANTIC_SEGMENTER_PROVIDER=zhipu` but `ZHIPU_API_KEY` is empty, the API returns a configuration error
+- Zhipu responses must be valid JSON and are validated before any `semantic_segments` rows are written
+- Zhipu segmentation is expected to produce complete topic segments and clip-ready content units instead of sentence-by-sentence summaries
+- The semantic output is expected to stay faithful to the ASR transcript and should not invent facts that are missing from `transcript_segments`
+- For longer videos, start with `ZHIPU_TIMEOUT_SECONDS=300` to reduce timeout failures
+- If Zhipu times out, the API now returns a clearer timeout message that can be shown directly in the frontend
+- Over-fragmented results are rejected server-side for long videos to avoid polluting the database with overly small segments
+- Current quality rejection covers too many segments, too many short segments, and overly fragmented opening segments on long videos
 
 Example success response:
 
@@ -228,7 +238,7 @@ Returns semantic segments ordered by `sort_order` ascending.
 
 Current sources of semantic segment rows:
 
-- `POST /api/videos/{video_id}/jobs/semantic-segmentation` via `MockSemanticSegmenterProvider`
+- `POST /api/videos/{video_id}/jobs/semantic-segmentation` via the configured semantic segmenter provider
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` via the existing demo pipeline
 
 ### `GET /api/videos/{video_id}/jobs`
@@ -237,8 +247,8 @@ Returns processing jobs ordered by `created_at` descending.
 
 ## Scope
 
-- This round adds synchronous FFmpeg-based audio extraction, configurable synchronous ASR transcription, and synchronous mock semantic segmentation.
-- This round does not implement any paid ASR provider, real LLM semantic segmentation provider, Celery processing, or clip export.
+- This round adds synchronous FFmpeg-based audio extraction, configurable synchronous ASR transcription, and configurable semantic segmentation.
+- This round does not implement any provider beyond local Faster-Whisper ASR and Zhipu semantic segmentation, Celery processing, or clip export.
 - The transcript and semantic segment data returned by the mock pipeline are synthetic Chinese fixtures for product loop validation in a brand-team scenario only.
 - Uploading a video only stores the original file and creates a pending `mock_pipeline` job for future processing stages.
-- Audio extraction, configured ASR transcription, and mock semantic segmentation remain separate API steps and are not chained automatically.
+- Audio extraction, configured ASR transcription, and configured semantic segmentation remain separate API steps and are not chained automatically.

@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Callable, Protocol
+
+import httpx
+
+from app.core.config import Settings
+from app.core.errors import APIError
 
 if TYPE_CHECKING:
     from app.models import TranscriptSegment
@@ -49,6 +56,472 @@ class MockSemanticSegmenterProvider:
             )
             for group_index, segment_group in enumerate(grouped_segments, start=1)
         ]
+
+
+class ZhipuSemanticSegmenterProvider:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        temperature: float,
+        timeout_seconds: int,
+        client_factory: Callable[[str, int], Any] | None = None,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.temperature = temperature
+        self.timeout_seconds = timeout_seconds
+        factory = client_factory or _build_zhipu_client
+        self._client = factory(self.api_key, self.timeout_seconds)
+
+    def segment(
+        self,
+        transcript_segments: list["TranscriptSegment"],
+    ) -> list[SemanticSegmentCandidate]:
+        ordered_segments = sorted(
+            transcript_segments,
+            key=lambda segment: segment.sort_order,
+        )
+        if not ordered_segments:
+            raise APIError(
+                500,
+                "semantic_segmenter_invalid_output",
+                "No transcript segments were provided to the semantic segmenter.",
+            )
+
+        transcript_payload = _build_transcript_payload(ordered_segments)
+        total_duration_seconds = _get_total_transcript_duration_seconds(ordered_segments)
+        system_prompt = _build_zhipu_system_prompt()
+        user_prompt = _build_zhipu_user_prompt(
+            transcript_payload=transcript_payload,
+            total_duration_seconds=total_duration_seconds,
+        )
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=self.temperature,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            raise _build_zhipu_request_error(exc) from exc
+
+        raw_content = _extract_response_content(response)
+        segment_payloads = _parse_segment_payloads(raw_content)
+        candidates = _validate_segment_payloads(
+            segment_payloads=segment_payloads,
+            transcript_segments=ordered_segments,
+        )
+        return candidates
+
+
+def create_semantic_segmenter_provider(settings: Settings) -> SemanticSegmenterProvider:
+    provider_name = settings.semantic_segmenter_provider.strip().lower()
+
+    if provider_name == "mock":
+        return MockSemanticSegmenterProvider()
+
+    if provider_name == "zhipu":
+        if not settings.zhipu_api_key.strip():
+            raise APIError(
+                500,
+                "zhipu_api_key_missing",
+                "ZHIPU_API_KEY is required when SEMANTIC_SEGMENTER_PROVIDER=zhipu.",
+            )
+        try:
+            return _get_cached_zhipu_semantic_segmenter_provider(
+                api_key=settings.zhipu_api_key,
+                model=settings.zhipu_model,
+                temperature=settings.zhipu_temperature,
+                timeout_seconds=settings.zhipu_timeout_seconds,
+            )
+        except RuntimeError as exc:
+            raise APIError(
+                500,
+                "semantic_segmenter_provider_unavailable",
+                str(exc),
+            ) from exc
+
+    raise APIError(
+        500,
+        "invalid_semantic_segmenter_provider",
+        (
+            f"Unsupported SEMANTIC_SEGMENTER_PROVIDER "
+            f"'{settings.semantic_segmenter_provider}'. "
+            "Supported values: mock, zhipu."
+        ),
+    )
+
+
+@lru_cache
+def _get_cached_zhipu_semantic_segmenter_provider(
+    *,
+    api_key: str,
+    model: str,
+    temperature: float,
+    timeout_seconds: int,
+) -> ZhipuSemanticSegmenterProvider:
+    return ZhipuSemanticSegmenterProvider(
+        api_key=api_key,
+        model=model,
+        temperature=temperature,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _build_zhipu_client(api_key: str, timeout_seconds: int) -> Any:
+    client_cls = _load_zhipu_client_cls()
+    return client_cls(
+        api_key=api_key,
+        timeout=httpx.Timeout(timeout_seconds),
+    )
+
+
+def _load_zhipu_client_cls() -> type[Any]:
+    try:
+        from zhipuai import ZhipuAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "zhipuai is not installed. Install apps/api requirements or set SEMANTIC_SEGMENTER_PROVIDER=mock."
+        ) from exc
+
+    return ZhipuAI
+
+
+def _build_transcript_payload(transcript_segments: list["TranscriptSegment"]) -> str:
+    lines = []
+    for segment in transcript_segments:
+        speaker = segment.speaker or "Unknown"
+        text = " ".join(segment.text.split())
+        lines.append(
+            f"- sort_order={segment.sort_order}, "
+            f"start_time={segment.start_time:.3f}, "
+            f"end_time={segment.end_time:.3f}, "
+            f"speaker={speaker}, "
+            f"text={text}"
+        )
+    return "\n".join(lines)
+
+
+def _build_zhipu_system_prompt() -> str:
+    return (
+        "你是品牌视频语义切片规划助手，不是逐句摘要工具。"
+        "你的任务是基于 transcript_segments 规划适合后续剪辑、审核和内容复用的完整话题段，"
+        "而不是按每句话切分。"
+        "你必须只基于 transcript_segments 中已经出现的信息生成结果，"
+        "不要纠正、扩写、脑补或发明 ASR 文本里没有的事实。"
+        "如果 ASR 文本疑似有错字或识别错误，也不要自行修正事实，只能保守概括。"
+    )
+
+
+def _build_zhipu_user_prompt(
+    *,
+    transcript_payload: str,
+    total_duration_seconds: float,
+) -> str:
+    return (
+        "请基于下方带时间戳的 transcript_segments，为品牌视频规划语义完整、可剪辑的片段：\n"
+        f"- 当前视频/转写总时长约 {total_duration_seconds:.1f} 秒\n"
+        "- 只输出 JSON，不要输出 Markdown，不要输出解释文本\n"
+        "- 顶层结构可以是 {\"segments\": [...]} 或直接 [...]\n"
+        "- 每个 segment 必须包含 start_time, end_time, title, summary, topic, keywords, transcript_text, confidence, reason\n"
+        "- 你不是逐句摘要工具，不要按每句话拆分\n"
+        "- 结果必须只基于 transcript_segments 里出现的信息，不要纠正、扩写、脑补或发明原文没有的事实\n"
+        "- 如果 ASR 文本疑似错字或误识别，也不要自行修正事实，只能保守概括\n"
+        "- summary 必须忠实描述 transcript_text，不要加入原文没有明确表达的判断\n"
+        "- reason 只解释为什么这里是语义边界，不要添加新事实\n"
+        "- title/topic 要概括该段主题，但不能虚构实体名、品牌名、人名或事件名\n"
+        "- transcript_text 必须来自对应 transcript_segments 的文本拼接或简洁摘录，不要引用无关内容\n"
+        "- 每个 segment 应对应完整话题、完整讨论点、完整场景或完整讲述单元，优先能作为品牌视频切片候选\n"
+        "- 如果相邻内容主题相近，应合并为一个段落\n"
+        "- 不要连续生成多个 5-10 秒碎片，除非视频极短且话题确实切换很快\n"
+        "- start_time/end_time 必须来自或贴近 transcript_segments 的时间范围，不要从句子中间切开\n"
+        "- 分段数量建议：1 分钟以内视频 1-3 段；1-3 分钟视频 2-4 段；3-8 分钟视频 4-6 段；8 分钟以上视频 5-8 段\n"
+        "- 时长建议：1 分钟以内视频可以出现 8-20 秒段落；3 分钟以上视频每段优先 30 秒以上\n"
+        "- 3-8 分钟视频优先输出 4-6 个完整话题段；无论如何不要超过 8 段\n"
+        "- title 不超过 30 字\n"
+        "- summary 不超过 120 字\n"
+        "- reason 不超过 120 字\n"
+        "- keywords 提供 3-6 个\n"
+        "- confidence 必须是 0 到 1 的数字\n"
+        "- 不要生成空 title、空 summary、空 topic、空 reason、空 transcript_text\n\n"
+        "transcript_segments：\n"
+        f"{transcript_payload}"
+    )
+
+
+def _extract_response_content(response: Any) -> str:
+    try:
+        content = response.choices[0].message.content
+    except Exception as exc:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            f"Zhipu response did not contain message content: {exc}",
+        ) from exc
+
+    if isinstance(content, str):
+        return _strip_json_fence(content.strip())
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+        joined_content = "".join(parts).strip()
+        if joined_content:
+            return _strip_json_fence(joined_content)
+
+    raise APIError(
+        500,
+        "semantic_segmenter_invalid_output",
+        "Zhipu response content was empty or not a supported text format.",
+    )
+
+
+def _strip_json_fence(value: str) -> str:
+    if value.startswith("```") and value.endswith("```"):
+        lines = value.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return value
+
+
+def _parse_segment_payloads(raw_content: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_json",
+            f"Failed to parse semantic segmenter JSON: {exc}",
+        ) from exc
+
+    if isinstance(parsed, dict):
+        segment_payloads = parsed.get("segments")
+    else:
+        segment_payloads = parsed
+
+    if not isinstance(segment_payloads, list):
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            "Semantic segmenter output must be a list or an object with a segments list.",
+        )
+
+    normalized_payloads: list[dict[str, Any]] = []
+    for payload in segment_payloads:
+        if not isinstance(payload, dict):
+            raise APIError(
+                500,
+                "semantic_segmenter_invalid_output",
+                "Each semantic segment must be an object.",
+            )
+        normalized_payloads.append(payload)
+
+    return normalized_payloads
+
+
+def _validate_segment_payloads(
+    *,
+    segment_payloads: list[dict[str, Any]],
+    transcript_segments: list["TranscriptSegment"],
+) -> list[SemanticSegmentCandidate]:
+    if not segment_payloads:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            "no_segments_generated: Zhipu semantic segmenter produced no segments.",
+        )
+
+    min_start = min(segment.start_time for segment in transcript_segments)
+    max_end = max(segment.end_time for segment in transcript_segments)
+
+    candidates: list[SemanticSegmentCandidate] = []
+    for payload in segment_payloads:
+        start_time = _coerce_float(payload, "start_time")
+        end_time = _coerce_float(payload, "end_time")
+        confidence = _coerce_float(payload, "confidence")
+        title = _coerce_non_empty_str(payload, "title")
+        summary = _coerce_non_empty_str(payload, "summary")
+        topic = _coerce_non_empty_str(payload, "topic")
+        transcript_text = _coerce_non_empty_str(payload, "transcript_text")
+        reason = _coerce_non_empty_str(payload, "reason")
+        keywords = _coerce_keywords(payload)
+
+        if start_time >= end_time:
+            raise APIError(
+                500,
+                "semantic_segmenter_invalid_output",
+                "Semantic segment start_time must be smaller than end_time.",
+            )
+
+        if not 0.0 <= confidence <= 1.0:
+            raise APIError(
+                500,
+                "semantic_segmenter_invalid_output",
+                "Semantic segment confidence must be between 0 and 1.",
+            )
+
+        if start_time < (min_start - 5.0) or end_time > (max_end + 5.0):
+            raise APIError(
+                500,
+                "semantic_segmenter_invalid_output",
+                "Semantic segment times fall outside the transcript range.",
+            )
+
+        candidates.append(
+            SemanticSegmentCandidate(
+                start_time=start_time,
+                end_time=end_time,
+                title=title,
+                summary=summary,
+                topic=topic,
+                keywords=keywords,
+                transcript_text=transcript_text,
+                confidence=confidence,
+                reason=reason,
+            )
+        )
+
+    candidates.sort(key=lambda candidate: (candidate.start_time, candidate.end_time))
+    _validate_segment_granularity(
+        candidates=candidates,
+        transcript_segments=transcript_segments,
+    )
+    return candidates
+
+
+def _validate_segment_granularity(
+    *,
+    candidates: list[SemanticSegmentCandidate],
+    transcript_segments: list["TranscriptSegment"],
+) -> None:
+    total_duration_seconds = _get_total_transcript_duration_seconds(transcript_segments)
+    if total_duration_seconds < 180.0:
+        return
+
+    if len(candidates) > 8:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            f"too_many_segments: Long video produced {len(candidates)} segments.",
+        )
+
+    short_segment_count = sum(
+        1 for candidate in candidates if (candidate.end_time - candidate.start_time) < 20.0
+    )
+    if short_segment_count > (len(candidates) / 2):
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            (
+                "segments_too_short: More than half of the generated segments are "
+                "shorter than 20 seconds for a long video."
+            ),
+        )
+
+    if len(candidates) >= 3:
+        opening_duration_seconds = sum(
+            candidate.end_time - candidate.start_time for candidate in candidates[:3]
+        )
+        if opening_duration_seconds < 30.0:
+            raise APIError(
+                500,
+                "semantic_segmenter_invalid_output",
+                (
+                    "opening_segments_too_fragmented: The first three generated "
+                    "segments cover less than 30 seconds for a long video."
+                ),
+            )
+
+
+def _get_total_transcript_duration_seconds(
+    transcript_segments: list["TranscriptSegment"],
+) -> float:
+    return max(segment.end_time for segment in transcript_segments) - min(
+        segment.start_time for segment in transcript_segments
+    )
+
+
+def _build_zhipu_request_error(exc: Exception) -> APIError:
+    detail = str(exc).strip() or exc.__class__.__name__
+    if _is_timeout_error(exc, detail):
+        return APIError(
+            500,
+            "semantic_segmenter_timeout",
+            (
+                "\u667a\u8c31\u8bed\u4e49\u5206\u6bb5\u8bf7\u6c42\u8d85\u65f6\uff0c"
+                "\u8bf7\u7a0d\u540e\u91cd\u8bd5\uff0c\u6216\u7f29\u77ed\u89c6\u9891/"
+                "\u589e\u52a0 ZHIPU_TIMEOUT_SECONDS\u3002 "
+                f"\u539f\u59cb\u9519\u8bef: {detail}"
+            ),
+        )
+
+    return APIError(
+        500,
+        "semantic_segmenter_request_failed",
+        f"\u667a\u8c31\u8bed\u4e49\u5206\u6bb5\u8bf7\u6c42\u5931\u8d25\uff1a{detail}",
+    )
+
+
+def _is_timeout_error(exc: Exception, detail: str) -> bool:
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+
+    normalized = detail.lower()
+    return "timed out" in normalized or "timeout" in normalized
+
+
+def _coerce_float(payload: dict[str, Any], field_name: str) -> float:
+    value = payload.get(field_name)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            f"Semantic segment field {field_name} must be a number.",
+        ) from exc
+
+
+def _coerce_non_empty_str(payload: dict[str, Any], field_name: str) -> str:
+    value = str(payload.get(field_name, "")).strip()
+    if not value:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            f"Semantic segment field {field_name} must be a non-empty string.",
+        )
+    return value
+
+
+def _coerce_keywords(payload: dict[str, Any]) -> list[str]:
+    keywords = payload.get("keywords")
+    if not isinstance(keywords, list):
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            "Semantic segment keywords must be a list of strings.",
+        )
+
+    normalized_keywords = [str(keyword).strip() for keyword in keywords if str(keyword).strip()]
+    if not normalized_keywords:
+        raise APIError(
+            500,
+            "semantic_segmenter_invalid_output",
+            "Semantic segment keywords must contain at least one non-empty string.",
+        )
+
+    return normalized_keywords
 
 
 def _group_transcript_segments(
