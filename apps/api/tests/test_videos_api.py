@@ -15,6 +15,9 @@ from app.api.deps import (
     get_semantic_segmenter_provider,
 )
 from app.core.constants import (
+    CLIP_EXPORT_STATUS_COMPLETED,
+    CLIP_EXPORT_STATUS_FAILED,
+    CLIP_EXPORT_STATUS_RUNNING,
     JOB_STATUS_COMPLETED,
     JOB_STATUS_FAILED,
     JOB_STATUS_PENDING,
@@ -25,8 +28,9 @@ from app.core.constants import (
 )
 from app.core.errors import APIError
 from app.main import app
-from app.models import ProcessingJob, SemanticSegment, TranscriptSegment, Video
+from app.models import ProcessingJob, SemanticSegment, TranscriptSegment, Video, VideoClip
 from app.services import audio_extraction as audio_extraction_service
+from app.services import clip_export as clip_export_service
 from app.services.asr import TranscriptResultSegment
 from app.services.semantic_segmenter import ZhipuSemanticSegmenterProvider
 
@@ -145,7 +149,10 @@ def test_upload_video_rejects_invalid_extension(client: TestClient) -> None:
     }
 
 
-def test_upload_video_rejects_oversized_file(client: TestClient, monkeypatch) -> None:
+def test_upload_video_rejects_file_exceeding_configured_limit(
+    client: TestClient,
+    monkeypatch,
+) -> None:
     from app.api.routes import videos as videos_route_module
 
     settings = videos_route_module.get_settings()
@@ -164,6 +171,33 @@ def test_upload_video_rejects_oversized_file(client: TestClient, monkeypatch) ->
             "message": "Uploaded file exceeds the 1 MB limit.",
         },
     }
+
+
+def test_upload_video_accepts_file_under_configured_limit(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+    monkeypatch,
+) -> None:
+    from app.api.routes import videos as videos_route_module
+
+    settings = videos_route_module.get_settings()
+    monkeypatch.setattr(settings, "max_upload_size_mb", 1)
+
+    response = client.post(
+        "/api/videos/upload",
+        files={"file": ("small.mp4", BytesIO(b"x" * (1024 * 1024 - 1)), "video/mp4")},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+
+    assert payload["success"] is True
+    assert payload["data"]["filename"] == "small.mp4"
+    assert len(fake_storage_service.uploads) == 1
+
+    saved_video = db_session.get(Video, UUID(payload["data"]["video_id"]))
+    assert saved_video is not None
 
 
 def test_upload_video_storage_failure_does_not_create_db_rows(
@@ -1578,3 +1612,801 @@ def test_get_video_transcript_returns_segments_in_sort_order(
     payload = response.json()
     assert payload["success"] is True
     assert [item["sort_order"] for item in payload["data"]] == [1, 2]
+
+
+def test_export_clip_requires_video(client: TestClient) -> None:
+    response = client.post(
+        f"/api/videos/{uuid4()}/segments/{uuid4()}/clips/export"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "video_not_found",
+            "message": "Video not found.",
+        },
+    }
+
+
+def test_export_clip_requires_segment(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="missing-segment.mp4",
+        original_url="http://storage.local/videos/missing-segment.mp4",
+        original_object_name="videos/example/original/missing-segment.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/videos/{video.id}/segments/{uuid4()}/clips/export"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "semantic_segment_not_found",
+            "message": "Semantic segment not found.",
+        },
+    }
+
+
+def test_export_clip_requires_segment_belongs_to_video(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    first_video = Video(
+        id=uuid4(),
+        filename="first.mp4",
+        original_url="http://storage.local/videos/first.mp4",
+        original_object_name="videos/example/original/first.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    second_video = Video(
+        id=uuid4(),
+        filename="second.mp4",
+        original_url="http://storage.local/videos/second.mp4",
+        original_object_name="videos/example/original/second.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=second_video,
+        start_time=12.0,
+        end_time=48.0,
+        title="Other video segment",
+        summary="Belongs to another video.",
+        topic="other-video",
+        keywords=["other", "video", "segment"],
+        transcript_text="This semantic segment belongs to the second video.",
+        confidence=0.88,
+        reason="This segment belongs to a different video.",
+        sort_order=1,
+    )
+    db_session.add_all([first_video, second_video, semantic_segment])
+    db_session.commit()
+
+    response = client.post(
+        f"/api/videos/{first_video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "semantic_segment_not_found",
+            "message": "Semantic segment not found.",
+        },
+    }
+
+
+def test_export_clip_requires_original_object_name(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="legacy-export.mp4",
+        original_url="http://storage.local/videos/legacy-export.mp4",
+        original_object_name=None,
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=None,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=8.0,
+        end_time=42.0,
+        title="Legacy segment",
+        summary="Legacy segment summary.",
+        topic="legacy",
+        keywords=["legacy", "segment", "export"],
+        transcript_text="Legacy transcript text.",
+        confidence=0.86,
+        reason="Legacy segment boundary.",
+        sort_order=1,
+    )
+    db_session.add_all([video, semantic_segment])
+    db_session.commit()
+
+    response = client.post(
+        f"/api/videos/{video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "missing_original_object",
+            "message": "Video original object is missing.",
+        },
+    }
+
+
+def test_export_clip_success_creates_video_clip(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+    monkeypatch,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="clip-export.mp4",
+        original_url="http://storage.local/videos/clip-export.mp4",
+        original_object_name=f"videos/{uuid4()}/original/clip-export.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=300.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=15.0,
+        end_time=63.0,
+        title="Clip export segment",
+        summary="Segment to export.",
+        topic="clip-export",
+        keywords=["clip", "export", "segment"],
+        transcript_text="This section becomes a clip export target.",
+        confidence=0.9,
+        reason="A complete topic for export.",
+        sort_order=1,
+    )
+    db_session.add_all([video, semantic_segment])
+    db_session.commit()
+
+    def fake_export_clip(
+        input_video_path: str,
+        output_clip_path: str,
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        assert Path(input_video_path).exists()
+        assert start_time == 15.0
+        assert end_time == 63.0
+        Path(output_clip_path).write_bytes(b"clip-data")
+
+    monkeypatch.setattr(
+        clip_export_service.ffmpeg_service,
+        "export_clip",
+        fake_export_clip,
+    )
+
+    response = client.post(
+        f"/api/videos/{video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == {
+        "video_id": str(video.id),
+        "semantic_segment_id": str(semantic_segment.id),
+        "clip_id": payload["data"]["clip_id"],
+        "clip_url": f"http://storage.local/videos/videos/{video.id}/clips/{semantic_segment.id}.mp4",
+        "clip_object_name": f"videos/{video.id}/clips/{semantic_segment.id}.mp4",
+        "export_status": CLIP_EXPORT_STATUS_COMPLETED,
+    }
+    assert len(fake_storage_service.downloads) == 1
+    assert fake_storage_service.downloads[0]["object_name"] == video.original_object_name
+    assert fake_storage_service.uploads[-1]["object_name"] == (
+        f"videos/{video.id}/clips/{semantic_segment.id}.mp4"
+    )
+
+    db_session.expire_all()
+    video_clip = db_session.scalars(
+        select(VideoClip).where(VideoClip.semantic_segment_id == semantic_segment.id)
+    ).one()
+    assert video_clip.title == semantic_segment.title
+    assert video_clip.clip_url == payload["data"]["clip_url"]
+    assert video_clip.clip_object_name == payload["data"]["clip_object_name"]
+    assert video_clip.export_status == CLIP_EXPORT_STATUS_COMPLETED
+    assert video_clip.error_message is None
+
+
+def test_export_clip_is_idempotent_for_same_segment(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="clip-export-repeat.mp4",
+        original_url="http://storage.local/videos/clip-export-repeat.mp4",
+        original_object_name=f"videos/{uuid4()}/original/clip-export-repeat.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=300.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=20.0,
+        end_time=75.0,
+        title="Repeatable clip",
+        summary="Repeat export target.",
+        topic="repeat",
+        keywords=["repeat", "clip", "export"],
+        transcript_text="Repeat export target transcript text.",
+        confidence=0.88,
+        reason="Stable export range.",
+        sort_order=1,
+    )
+    db_session.add_all([video, semantic_segment])
+    db_session.commit()
+
+    export_calls: list[tuple[float, float]] = []
+
+    def fake_export_clip(
+        input_video_path: str,
+        output_clip_path: str,
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        export_calls.append((start_time, end_time))
+        Path(output_clip_path).write_bytes(b"clip-data")
+
+    monkeypatch.setattr(
+        clip_export_service.ffmpeg_service,
+        "export_clip",
+        fake_export_clip,
+    )
+
+    first_response = client.post(
+        f"/api/videos/{video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+    second_response = client.post(
+        f"/api/videos/{video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert export_calls == [(20.0, 75.0), (20.0, 75.0)]
+
+    db_session.expire_all()
+    clips = db_session.scalars(
+        select(VideoClip).where(VideoClip.semantic_segment_id == semantic_segment.id)
+    ).all()
+    assert len(clips) == 1
+    assert clips[0].export_status == CLIP_EXPORT_STATUS_COMPLETED
+
+
+def test_export_clip_ffmpeg_failure_marks_clip_failed(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="clip-ffmpeg-fail.mp4",
+        original_url="http://storage.local/videos/clip-ffmpeg-fail.mp4",
+        original_object_name=f"videos/{uuid4()}/original/clip-ffmpeg-fail.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=180.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=10.0,
+        end_time=36.0,
+        title="FFmpeg fail clip",
+        summary="Segment for ffmpeg failure.",
+        topic="ffmpeg-fail",
+        keywords=["ffmpeg", "fail", "clip"],
+        transcript_text="Clip export fails in ffmpeg.",
+        confidence=0.82,
+        reason="A test range.",
+        sort_order=1,
+    )
+    db_session.add_all([video, semantic_segment])
+    db_session.commit()
+
+    def fake_export_clip(*args, **kwargs) -> None:
+        raise RuntimeError("ffmpeg clip export exploded")
+
+    monkeypatch.setattr(
+        clip_export_service.ffmpeg_service,
+        "export_clip",
+        fake_export_clip,
+    )
+
+    response = client.post(
+        f"/api/videos/{video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "clip_export_failed",
+            "message": "Failed to export clip.",
+        },
+    }
+
+    db_session.expire_all()
+    video_clip = db_session.scalars(
+        select(VideoClip).where(VideoClip.semantic_segment_id == semantic_segment.id)
+    ).one()
+    assert video_clip.export_status == CLIP_EXPORT_STATUS_FAILED
+    assert video_clip.error_message is not None
+    assert "ffmpeg clip export exploded" in video_clip.error_message
+
+
+def test_export_clip_storage_upload_failure_marks_clip_failed(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+    monkeypatch,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="clip-upload-fail.mp4",
+        original_url="http://storage.local/videos/clip-upload-fail.mp4",
+        original_object_name=f"videos/{uuid4()}/original/clip-upload-fail.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=180.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=14.0,
+        end_time=44.0,
+        title="Upload fail clip",
+        summary="Segment for upload failure.",
+        topic="upload-fail",
+        keywords=["upload", "fail", "clip"],
+        transcript_text="Clip export upload fails.",
+        confidence=0.82,
+        reason="A test range.",
+        sort_order=1,
+    )
+    db_session.add_all([video, semantic_segment])
+    db_session.commit()
+
+    def fake_export_clip(
+        input_video_path: str,
+        output_clip_path: str,
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        Path(output_clip_path).write_bytes(b"clip-data")
+
+    monkeypatch.setattr(
+        clip_export_service.ffmpeg_service,
+        "export_clip",
+        fake_export_clip,
+    )
+    fake_storage_service.raise_on_upload = True
+
+    response = client.post(
+        f"/api/videos/{video.id}/segments/{semantic_segment.id}/clips/export"
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "clip_export_failed",
+            "message": "Failed to export clip.",
+        },
+    }
+
+    db_session.expire_all()
+    video_clip = db_session.scalars(
+        select(VideoClip).where(VideoClip.semantic_segment_id == semantic_segment.id)
+    ).one()
+    assert video_clip.export_status == CLIP_EXPORT_STATUS_FAILED
+    assert video_clip.error_message is not None
+    assert "upload failed" in video_clip.error_message
+
+
+def test_get_video_clips_returns_clips(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="clips-list.mp4",
+        original_url="http://storage.local/videos/clips-list.mp4",
+        original_object_name=f"videos/{uuid4()}/original/clips-list.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=220.0,
+        status="pending",
+    )
+    first_segment = SemanticSegment(
+        video=video,
+        start_time=0.0,
+        end_time=45.0,
+        title="First segment",
+        summary="First summary.",
+        topic="first",
+        keywords=["first", "clip", "segment"],
+        transcript_text="First segment transcript.",
+        confidence=0.9,
+        reason="First boundary.",
+        sort_order=1,
+    )
+    second_segment = SemanticSegment(
+        video=video,
+        start_time=45.0,
+        end_time=90.0,
+        title="Second segment",
+        summary="Second summary.",
+        topic="second",
+        keywords=["second", "clip", "segment"],
+        transcript_text="Second segment transcript.",
+        confidence=0.88,
+        reason="Second boundary.",
+        sort_order=2,
+    )
+    later_clip = VideoClip(
+        video=video,
+        semantic_segment=second_segment,
+        start_time=45.0,
+        end_time=90.0,
+        title="Second segment",
+        clip_url="http://storage.local/videos/videos/example/clips/second.mp4",
+        clip_object_name="videos/example/clips/second.mp4",
+        subtitle_url=None,
+        export_status=CLIP_EXPORT_STATUS_RUNNING,
+        error_message=None,
+        created_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    earlier_clip = VideoClip(
+        video=video,
+        semantic_segment=first_segment,
+        start_time=0.0,
+        end_time=45.0,
+        title="First segment",
+        clip_url="http://storage.local/videos/videos/example/clips/first.mp4",
+        clip_object_name="videos/example/clips/first.mp4",
+        subtitle_url=None,
+        export_status=CLIP_EXPORT_STATUS_COMPLETED,
+        error_message=None,
+        created_at=datetime.now(timezone.utc),
+    )
+    db_session.add_all([video, first_segment, second_segment, later_clip, earlier_clip])
+    db_session.commit()
+
+    response = client.get(f"/api/videos/{video.id}/clips")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert [item["semantic_segment_id"] for item in payload["data"]] == [
+        str(first_segment.id),
+        str(second_segment.id),
+    ]
+    assert payload["data"][0]["clip_url"] == earlier_clip.clip_url
+    assert payload["data"][1]["export_status"] == CLIP_EXPORT_STATUS_RUNNING
+
+
+def test_download_clip_requires_video(client: TestClient) -> None:
+    response = client.get(
+        f"/api/videos/{uuid4()}/clips/{uuid4()}/download"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "video_not_found",
+            "message": "Video not found.",
+        },
+    }
+
+
+def test_download_clip_requires_clip(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="download-missing-clip.mp4",
+        original_url="http://storage.local/videos/download-missing-clip.mp4",
+        original_object_name="videos/example/original/download-missing-clip.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=120.0,
+        status="pending",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    response = client.get(
+        f"/api/videos/{video.id}/clips/{uuid4()}/download"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "clip_not_found",
+            "message": "Clip not found.",
+        },
+    }
+
+
+def test_download_clip_requires_clip_belongs_to_video(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    first_video = Video(
+        id=uuid4(),
+        filename="download-first.mp4",
+        original_url="http://storage.local/videos/download-first.mp4",
+        original_object_name="videos/example/original/download-first.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=120.0,
+        status="pending",
+    )
+    second_video = Video(
+        id=uuid4(),
+        filename="download-second.mp4",
+        original_url="http://storage.local/videos/download-second.mp4",
+        original_object_name="videos/example/original/download-second.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=120.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=second_video,
+        start_time=0.0,
+        end_time=30.0,
+        title="Downloadable segment",
+        summary="Segment for clip download.",
+        topic="download",
+        keywords=["clip", "download", "segment"],
+        transcript_text="Downloadable segment transcript.",
+        confidence=0.9,
+        reason="Stable segment boundary.",
+        sort_order=1,
+    )
+    clip = VideoClip(
+        video=second_video,
+        semantic_segment=semantic_segment,
+        start_time=0.0,
+        end_time=30.0,
+        title="Downloadable segment",
+        clip_url="http://storage.local/videos/videos/example/clips/downloadable.mp4",
+        clip_object_name="videos/example/clips/downloadable.mp4",
+        subtitle_url=None,
+        export_status=CLIP_EXPORT_STATUS_COMPLETED,
+        error_message=None,
+    )
+    db_session.add_all([first_video, second_video, semantic_segment, clip])
+    db_session.commit()
+
+    response = client.get(
+        f"/api/videos/{first_video.id}/clips/{clip.id}/download"
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "clip_not_found",
+            "message": "Clip not found.",
+        },
+    }
+
+
+def test_download_clip_requires_completed_status(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="download-pending.mp4",
+        original_url="http://storage.local/videos/download-pending.mp4",
+        original_object_name="videos/example/original/download-pending.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=120.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=0.0,
+        end_time=30.0,
+        title="Pending clip segment",
+        summary="Pending clip summary.",
+        topic="pending-clip",
+        keywords=["pending", "clip", "segment"],
+        transcript_text="Pending clip transcript.",
+        confidence=0.9,
+        reason="Pending clip reason.",
+        sort_order=1,
+    )
+    clip = VideoClip(
+        video=video,
+        semantic_segment=semantic_segment,
+        start_time=0.0,
+        end_time=30.0,
+        title="Pending clip segment",
+        clip_url="http://storage.local/videos/videos/example/clips/pending.mp4",
+        clip_object_name="videos/example/clips/pending.mp4",
+        subtitle_url=None,
+        export_status=CLIP_EXPORT_STATUS_RUNNING,
+        error_message=None,
+    )
+    db_session.add_all([video, semantic_segment, clip])
+    db_session.commit()
+
+    response = client.get(
+        f"/api/videos/{video.id}/clips/{clip.id}/download"
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "clip_not_ready",
+            "message": "Clip export is not completed yet.",
+        },
+    }
+
+
+def test_download_clip_requires_clip_object_name(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="download-missing-object.mp4",
+        original_url="http://storage.local/videos/download-missing-object.mp4",
+        original_object_name="videos/example/original/download-missing-object.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=120.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=0.0,
+        end_time=30.0,
+        title="Missing object segment",
+        summary="Missing object summary.",
+        topic="missing-object",
+        keywords=["missing", "object", "clip"],
+        transcript_text="Missing object transcript.",
+        confidence=0.9,
+        reason="Missing object reason.",
+        sort_order=1,
+    )
+    clip = VideoClip(
+        video=video,
+        semantic_segment=semantic_segment,
+        start_time=0.0,
+        end_time=30.0,
+        title="Missing object segment",
+        clip_url="http://storage.local/videos/videos/example/clips/missing.mp4",
+        clip_object_name=None,
+        subtitle_url=None,
+        export_status=CLIP_EXPORT_STATUS_COMPLETED,
+        error_message=None,
+    )
+    db_session.add_all([video, semantic_segment, clip])
+    db_session.commit()
+
+    response = client.get(
+        f"/api/videos/{video.id}/clips/{clip.id}/download"
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "success": False,
+        "error": {
+            "code": "missing_clip_object",
+            "message": "Clip object is missing.",
+        },
+    }
+
+
+def test_download_clip_success_returns_mp4(
+    client: TestClient,
+    db_session: Session,
+    fake_storage_service,
+) -> None:
+    video = Video(
+        id=uuid4(),
+        filename="download-success.mp4",
+        original_url="http://storage.local/videos/download-success.mp4",
+        original_object_name="videos/example/original/download-success.mp4",
+        preview_url=None,
+        audio_url=None,
+        audio_object_name=None,
+        duration_seconds=120.0,
+        status="pending",
+    )
+    semantic_segment = SemanticSegment(
+        video=video,
+        start_time=0.0,
+        end_time=30.0,
+        title="downloadable-clip",
+        summary="Downloadable clip summary.",
+        topic="download-success",
+        keywords=["download", "clip", "success"],
+        transcript_text="Downloadable clip transcript.",
+        confidence=0.9,
+        reason="Downloadable clip reason.",
+        sort_order=1,
+    )
+    clip = VideoClip(
+        video=video,
+        semantic_segment=semantic_segment,
+        start_time=0.0,
+        end_time=30.0,
+        title="downloadable-clip",
+        clip_url="http://storage.local/videos/videos/example/clips/downloadable.mp4",
+        clip_object_name="videos/example/clips/downloadable.mp4",
+        subtitle_url=None,
+        export_status=CLIP_EXPORT_STATUS_COMPLETED,
+        error_message=None,
+    )
+    db_session.add_all([video, semantic_segment, clip])
+    db_session.commit()
+
+    response = client.get(
+        f"/api/videos/{video.id}/clips/{clip.id}/download"
+    )
+
+    assert response.status_code == 200
+    assert "video/mp4" in response.headers["content-type"]
+    assert ".mp4" in response.headers["content-disposition"]
+    assert response.content == b"video-data"
+    assert fake_storage_service.downloads[-1]["object_name"] == clip.clip_object_name

@@ -42,6 +42,22 @@ packages/
 3. Confirm `BACKEND_CORS_ORIGINS` includes your frontend origin, such as `http://localhost:3000`.
 4. Keep `ASR_PROVIDER=mock` for normal development, or switch to `ASR_PROVIDER=faster_whisper` only when you want local real ASR.
 
+## Long Video Upload
+
+The backend upload size limit is controlled by `MAX_UPLOAD_SIZE_MB` in the repository root `.env`. The default value is `500`.
+
+If you need to upload longer business videos locally, raise the limit for your environment, for example:
+
+```dotenv
+MAX_UPLOAD_SIZE_MB=2048
+```
+
+Notes:
+
+- A 50-minute business video can be uploaded locally after raising the limit, but upload time and temporary disk usage will increase.
+- Audio extraction, ASR transcription, and semantic segmentation all take longer on larger source videos.
+- Long-video semantic segmentation will eventually need transcript chunking or multi-pass processing. The current MVP should not rely on a single large LLM request forever.
+
 ## Install Dependencies
 
 ### Web
@@ -148,6 +164,12 @@ Mock semantic segmentation example:
 curl -X POST http://localhost:8000/api/videos/{video_id}/jobs/semantic-segmentation
 ```
 
+Clip export example:
+
+```powershell
+curl -X POST http://localhost:8000/api/videos/{video_id}/segments/{segment_id}/clips/export
+```
+
 The audio extraction endpoint requires local `ffmpeg` and `ffprobe`.
 The transcription endpoint supports `ASR_PROVIDER=mock` or `ASR_PROVIDER=faster_whisper`.
 The semantic segmentation endpoint supports `SEMANTIC_SEGMENTER_PROVIDER=mock` or `SEMANTIC_SEGMENTER_PROVIDER=zhipu`.
@@ -196,6 +218,9 @@ Current synchronous processing path:
 2. Extract audio
 3. Generate transcript with the configured ASR provider
 4. Generate semantic segments with the configured semantic segmenter provider
+5. Export MP4 clips from semantic segment time ranges
+
+The upload step still enforces `MAX_UPLOAD_SIZE_MB`, so raise that value in `.env` before testing long source videos.
 
 ## Local Faster-Whisper ASR
 
@@ -287,6 +312,30 @@ ffprobe -version
 6. Confirm the `extract_audio` job status becomes the completed audio extraction state.
 7. Open the MinIO Console at `http://localhost:9001` and verify `videos/{video_id}/audio/audio.wav` exists.
 
+## Clip Export Flow
+
+1. Upload video
+2. Extract audio
+3. Generate transcript
+4. Generate semantic segments
+5. Export a clip from one semantic segment
+6. Download the clip through the backend proxy endpoint instead of the private MinIO URL
+
+## Clip Export Smoke Test
+
+1. Upload a new video.
+2. Extract audio.
+3. Generate transcript.
+4. Generate semantic segments.
+5. Open the video detail page and click one semantic segment's export button.
+6. Wait for the export to finish and click the download link.
+7. Open the MinIO Console at `http://localhost:9001` and verify `videos/{video_id}/clips/{segment_id}.mp4` exists.
+
+Notes:
+
+- Clip download is proxied through the backend API.
+- The MinIO bucket does not need to be public for clip downloads to work in the browser.
+
 ### Celery Worker
 
 ```powershell
@@ -322,14 +371,17 @@ pytest
 - `POST /api/videos/{video_id}/jobs/extract-audio` downloads the original MinIO object, extracts mono 16 kHz WAV audio with FFmpeg, uploads the generated audio back to MinIO, and stores audio metadata on the `videos` row.
 - `POST /api/videos/{video_id}/jobs/transcribe-audio` reads `audio_object_name`, then uses the configured ASR provider to write transcript rows into `transcript_segments`.
 - `POST /api/videos/{video_id}/jobs/semantic-segmentation` reads `transcript_segments`, then uses the configured semantic segmenter provider to write semantic rows into `semantic_segments`.
+- `POST /api/videos/{video_id}/segments/{segment_id}/clips/export` downloads the original MinIO video, exports an MP4 clip for the semantic segment time range with FFmpeg, uploads it back to MinIO, and creates or updates one `video_clips` row.
+- `GET /api/videos/{video_id}/clips/{clip_id}/download` proxies one exported clip through the backend so the browser does not need direct access to the private MinIO object.
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` runs a synchronous mock transcript and semantic segmentation pipeline for product-loop validation.
 - `GET /api/videos` lists uploaded videos ordered by `created_at` descending.
 - `GET /api/videos/{video_id}` returns one video record.
 - `GET /api/videos/{video_id}/transcript` returns transcript segments in `sort_order` order, or an empty array when none exist.
-- `GET /api/videos/{video_id}/segments` returns mock semantic segments in `sort_order` order.
+- `GET /api/videos/{video_id}/segments` returns semantic segments in `sort_order` order.
+- `GET /api/videos/{video_id}/clips` returns exported clips for the video.
 - `GET /api/videos/{video_id}/jobs` returns processing jobs for the video.
 - The frontend MVP includes `/`, `/videos`, and `/videos/{id}` pages that call the existing backend APIs directly.
-- The frontend can now trigger synchronous audio extraction, configured ASR transcription, and configured semantic segmentation from the detail page.
+- The frontend can now trigger synchronous audio extraction, configured ASR transcription, configured semantic segmentation, and per-segment clip export from the detail page.
 - The frontend expects `NEXT_PUBLIC_API_BASE_URL` to point at the running FastAPI service.
 - Celery wiring is scaffolded, but no real video-processing tasks are implemented.
 
@@ -341,9 +393,10 @@ Detailed API note: see `docs/api.md`.
 - Default development transcription still uses `MockASRProvider`
 - Real semantic segmentation currently supports Zhipu GLM only
 - Default development semantic segmentation still uses `MockSemanticSegmenterProvider`
-- No video clip export pipeline yet
+- Clip export currently supports single-segment synchronous MP4 export only
 - Uploading a video only creates a pending `mock_pipeline` job until the mock pipeline endpoint is called
 - Audio extraction runs synchronously in the API process and is not queued through Celery yet
+- Clip export also runs synchronously in the API process and is not queued through Celery yet
 - The mock pipeline produces synthetic transcript and semantic segment data for product validation only
 - No real video preview or player
 - No real background processing pipeline

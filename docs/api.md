@@ -26,7 +26,7 @@ Accepts a multipart file upload using the `file` field.
 Behavior:
 
 - Validates file extension against `mp4`, `mov`, `webm`, `mkv`
-- Validates size against `MAX_UPLOAD_SIZE_MB`
+- Validates size against `MAX_UPLOAD_SIZE_MB` from the backend environment, default `500`
 - Uploads the original file to MinIO
 - Creates a `videos` row
 - Creates a pending `processing_jobs` row with `job_type = "mock_pipeline"`
@@ -50,6 +50,8 @@ Development note:
 
 - `original_url` currently stores a local MinIO access URL for development convenience.
 - Future workers should prefer `bucket + object_name` or an internal object key instead of depending on `original_url`.
+- For longer local business videos, raise `MAX_UPLOAD_SIZE_MB` in `.env`, for example `2048`.
+- Larger uploads make downstream audio extraction, ASR, and semantic segmentation slower.
 
 Example error response:
 
@@ -232,6 +234,41 @@ Example success response:
 }
 ```
 
+### `POST /api/videos/{video_id}/segments/{segment_id}/clips/export`
+
+Reads the original uploaded video from MinIO, cuts an MP4 clip for the target semantic segment time range with local `ffmpeg`, uploads the clip back to MinIO, and creates or updates a `video_clips` row.
+
+Requirements:
+
+- The video must exist, otherwise the API returns `404 video_not_found`
+- The semantic segment must exist and belong to the video, otherwise the API returns `404 semantic_segment_not_found`
+- `video.original_object_name` must exist, otherwise the API returns `400 missing_original_object`
+- Local `ffmpeg` must be installed and available on `PATH`
+
+Behavior:
+
+- Reuses the same `video_clips` row for repeated exports of the same semantic segment
+- Sets `export_status` to `running -> completed` on success
+- Stores `clip_url`, `clip_object_name`, `title`, and any failure `error_message` on the `video_clips` row
+- Returns `500 clip_export_failed` if MinIO download, `ffmpeg`, upload, or final database persistence fails
+- This round exports MP4 clips only and does not expose complex transcoding parameter controls
+
+Example success response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "video_id": "d828ea75-bd27-4cbf-9fd3-4c480d9a577c",
+    "semantic_segment_id": "4374ca06-2f8b-4d87-b6df-e3fd772cc013",
+    "clip_id": "bdf99599-b9ab-4a2f-aef8-462fb9d93290",
+    "clip_url": "http://localhost:9000/videos/videos/d828ea75-bd27-4cbf-9fd3-4c480d9a577c/clips/4374ca06-2f8b-4d87-b6df-e3fd772cc013.mp4",
+    "clip_object_name": "videos/d828ea75-bd27-4cbf-9fd3-4c480d9a577c/clips/4374ca06-2f8b-4d87-b6df-e3fd772cc013.mp4",
+    "export_status": "completed"
+  }
+}
+```
+
 ### `GET /api/videos/{video_id}/segments`
 
 Returns semantic segments ordered by `sort_order` ascending.
@@ -241,14 +278,39 @@ Current sources of semantic segment rows:
 - `POST /api/videos/{video_id}/jobs/semantic-segmentation` via the configured semantic segmenter provider
 - `POST /api/videos/{video_id}/jobs/mock-pipeline` via the existing demo pipeline
 
+### `GET /api/videos/{video_id}/clips`
+
+Returns exported video clips for the target video.
+
+Behavior:
+
+- Returns `404 video_not_found` if the video does not exist
+- Returns clip rows ordered for frontend display, preferring semantic segment sort order
+- Exposes `clip_url`, `clip_object_name`, `export_status`, and `error_message` so the detail page can show download links and failures
+- This endpoint reflects exported MP4 clip metadata only; it does not provide a video player or batch export features
+
+### `GET /api/videos/{video_id}/clips/{clip_id}/download`
+
+Downloads one exported clip through the FastAPI service instead of exposing the private MinIO object URL directly.
+
+Behavior:
+
+- Returns `404 video_not_found` if the video does not exist
+- Returns `404 clip_not_found` if the clip does not exist or does not belong to the video
+- Returns `400 clip_not_ready` if the clip export is not completed
+- Returns `400 missing_clip_object` if the clip row does not have a stored object name
+- Downloads the private MinIO object to a temporary local file and returns it as `video/mp4`
+- Sets `Content-Disposition` so the browser downloads a safe `.mp4` filename
+- This round uses backend proxy download only; it does not make the MinIO bucket public and does not generate presigned URLs
+
 ### `GET /api/videos/{video_id}/jobs`
 
 Returns processing jobs ordered by `created_at` descending.
 
 ## Scope
 
-- This round adds synchronous FFmpeg-based audio extraction, configurable synchronous ASR transcription, and configurable semantic segmentation.
-- This round does not implement any provider beyond local Faster-Whisper ASR and Zhipu semantic segmentation, Celery processing, or clip export.
+- This round adds synchronous FFmpeg-based audio extraction, configurable synchronous ASR transcription, configurable semantic segmentation, and per-segment MP4 clip export.
+- This round does not implement any provider beyond local Faster-Whisper ASR and Zhipu semantic segmentation, Celery processing, batch clip export, or advanced transcoding controls.
 - The transcript and semantic segment data returned by the mock pipeline are synthetic Chinese fixtures for product loop validation in a brand-team scenario only.
 - Uploading a video only stores the original file and creates a pending `mock_pipeline` job for future processing stages.
-- Audio extraction, configured ASR transcription, and configured semantic segmentation remain separate API steps and are not chained automatically.
+- Audio extraction, configured ASR transcription, configured semantic segmentation, and clip export remain separate API steps and are not chained automatically.

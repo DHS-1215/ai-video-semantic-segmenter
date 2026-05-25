@@ -78,7 +78,7 @@ export default function HomePage() {
           />
           <p className="field-hint">
             {
-              "\u652f\u6301 mp4\u3001mov\u3001webm\u3001mkv\u3002\u4e0a\u4f20\u6210\u529f\u540e\u4f1a\u81ea\u52a8\u8df3\u8f6c\u5230\u89c6\u9891\u8be6\u60c5\u9875\u3002"
+              "\u652f\u6301 mp4\u3001mov\u3001webm\u3001mkv\u3002\u4e0a\u4f20\u5927\u5c0f\u9650\u5236\u7531\u540e\u7aef\u914d\u7f6e\u51b3\u5b9a\u3002"
             }
           </p>
 
